@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- Shield shape: rounded top, pointed bottom — white outline -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M54,24 L30,32 C30,32 28,33 28,36 L28,52 C28,66 38,78 54,84 C70,78 80,66 80,52 L80,36 C80,33 78,32 78,32 Z" />
+
+    <!-- Inner shield fill (indigo, slightly lighter than background) -->
+    <path
+        android:fillColor="#283593"
+        android:pathData="M54,28 L33,35 C33,35 32,36 32,38 L32,52 C32,64 40.5,74.5 54,80 C67.5,74.5 76,64 76,52 L76,38 C76,36 75,35 75,35 Z" />
+
+    <!-- Letter "U" in the center of the shield -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M43,42 L43,56 C43,62.1 47.9,67 54,67 C60.1,67 65,62.1 65,56 L65,42 L60,42 L60,56 C60,59.3 57.3,62 54,62 C50.7,62 48,59.3 48,56 L48,42 Z" />
+</vector>
