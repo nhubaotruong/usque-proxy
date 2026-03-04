@@ -35,7 +35,6 @@ enum class VpnState { DISCONNECTED, CONNECTING, CONNECTED }
 data class TunnelStats(
     val txBytes: Long = 0,
     val rxBytes: Long = 0,
-    val uptimeSec: Int = 0,
 )
 
 class VpnViewModel(application: Application) : AndroidViewModel(application) {
@@ -51,6 +50,9 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _stats = MutableStateFlow(TunnelStats())
     val stats: StateFlow<TunnelStats> = _stats.asStateFlow()
+
+    private val _connectedSince = MutableStateFlow<Long?>(null)
+    val connectedSince: StateFlow<Long?> = _connectedSince.asStateFlow()
 
     private val _installedApps = MutableStateFlow<List<AppInfo>>(emptyList())
     val installedApps: StateFlow<List<AppInfo>> = _installedApps.asStateFlow()
@@ -97,13 +99,20 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
 
                 if (running) {
                     runCatching {
-                        val json = JSONObject(Usquebind.getStats())
+                        val json = withContext(Dispatchers.IO) {
+                            JSONObject(Usquebind.getStats())
+                        }
                         _stats.value = TunnelStats(
                             txBytes = json.optLong("tx_bytes", 0L),
                             rxBytes = json.optLong("rx_bytes", 0L),
-                            uptimeSec = json.optInt("uptime_sec", 0),
                         )
+                        if (_connectedSince.value == null) {
+                            val uptimeSec = json.optInt("uptime_sec", 0)
+                            _connectedSince.value = System.currentTimeMillis() - uptimeSec * 1000L
+                        }
                     }
+                } else {
+                    _connectedSince.value = null
                 }
                 delay(POLL_INTERVAL_FOREGROUND)
             }
@@ -137,6 +146,7 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         }
         ctx.startService(intent)
         _vpnState.value = VpnState.DISCONNECTED
+        _connectedSince.value = null
         _needsRestart.value = false
     }
 

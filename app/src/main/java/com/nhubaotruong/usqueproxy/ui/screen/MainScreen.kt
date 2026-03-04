@@ -17,17 +17,21 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.nhubaotruong.usqueproxy.data.ProfileType
-import com.nhubaotruong.usqueproxy.ui.viewmodel.TunnelStats
 import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnState
 import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnViewModel
+import kotlinx.coroutines.delay
 
 @Composable
 fun MainScreen(
@@ -35,7 +39,6 @@ fun MainScreen(
     onRequestVpnPermission: () -> Unit,
 ) {
     val vpnState by viewModel.vpnState.collectAsState()
-    val stats by viewModel.stats.collectAsState()
     val prefs by viewModel.vpnPrefs.collectAsState()
     val tunnelError by viewModel.tunnelError.collectAsState()
 
@@ -71,7 +74,7 @@ fun MainScreen(
 
         if (vpnState == VpnState.CONNECTED) {
             Spacer(Modifier.height(16.dp))
-            StatsDisplay(stats)
+            StatsDisplay(viewModel)
         }
     }
 }
@@ -144,10 +147,26 @@ private fun StatusText(state: VpnState, activeProfile: ProfileType) {
 }
 
 @Composable
-private fun StatsDisplay(stats: TunnelStats) {
+private fun StatsDisplay(viewModel: VpnViewModel) {
+    val stats by viewModel.stats.collectAsState()
+    val connectedSince by viewModel.connectedSince.collectAsState()
+
+    var uptimeSec by remember { mutableIntStateOf(0) }
+    LaunchedEffect(connectedSince) {
+        val since = connectedSince
+        if (since != null) {
+            while (true) {
+                uptimeSec = ((System.currentTimeMillis() - since) / 1000).toInt()
+                delay(1_000L)
+            }
+        } else {
+            uptimeSec = 0
+        }
+    }
+
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
         Text(
-            formatUptime(stats.uptimeSec),
+            formatUptime(uptimeSec),
             style = MaterialTheme.typography.headlineSmall,
         )
         Spacer(Modifier.height(8.dp))

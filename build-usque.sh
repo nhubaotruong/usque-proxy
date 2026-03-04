@@ -20,7 +20,7 @@ if [ -f default.pgo ]; then
   PGO_FLAG="-pgo=default.pgo"
 fi
 
-gomobile bind -v -target=android/arm64,android/amd64 -androidapi 31 \
+gomobile bind -v -target=android/arm64 -androidapi 31 \
   -trimpath \
   -ldflags="-s -w" \
   ${PGO_FLAG:+"$PGO_FLAG"} \

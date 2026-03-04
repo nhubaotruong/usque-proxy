@@ -39,6 +39,22 @@ const (
 	defaultLocale = "en_US"
 )
 
+// taggedEndpoint pairs a resolved UDP address with a label for logging.
+type taggedEndpoint struct {
+	addr *net.UDPAddr
+	tag  string
+}
+
+// connResult holds the outcome of a single tunnel connection attempt.
+type connResult struct {
+	udpConn *net.UDPConn
+	tr      *http3.Transport
+	ipConn  *connectip.Conn
+	rsp     *http.Response
+	err     error
+	tag     string
+}
+
 // tunnelConfig extends config.Config with optional tunnel parameters.
 type tunnelConfig struct {
 	config.Config
@@ -413,21 +429,19 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			continue
 		}
 
-		endpoint := &net.UDPAddr{IP: net.ParseIP(cfg.EndpointV4), Port: connectPort}
-		log.Printf("Connecting to %s:%d", endpoint.IP, endpoint.Port)
-
 		quicCfg := &quic.Config{
 			EnableDatagrams:   true,
 			InitialPacketSize: packetSize,
 			KeepAlivePeriod:   keepalive,
 		}
 
-		udpConn, tr, ipConn, rsp, err := connectTunnelProtected(ctx, tlsCfg, quicCfg, endpoint, cfg.connectUri(), protector)
+		udpConn, tr, ipConn, rsp, err := connectHappyEyeballs(
+			ctx, tlsCfg, quicCfg,
+			cfg.EndpointV4, cfg.EndpointV6,
+			connectPort, cfg.connectUri(), protector,
+		)
 		if err != nil {
 			log.Printf("connect: %v", err)
-			if udpConn != nil {
-				udpConn.Close()
-			}
 			sleepCtx(ctx, backoff)
 			backoff = nextBackoff(backoff, maxBackoff)
 			continue
@@ -472,6 +486,112 @@ func nextBackoff(current, max time.Duration) time.Duration {
 		return max
 	}
 	return next
+}
+
+// connectHappyEyeballs implements Happy Eyeballs v3 (RFC 8305 / draft-ietf-happy-happyeyeballs-v3)
+// for the QUIC/Connect-IP tunnel connection. It races IPv6 and IPv4 with a
+// 250ms staggered delay, preferring IPv6 per the spec.
+func connectHappyEyeballs(
+	ctx context.Context,
+	tlsConfig *tls.Config,
+	quicConfig *quic.Config,
+	endpointV4, endpointV6 string,
+	connectPort int,
+	connectUri string,
+	protector VpnProtector,
+) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
+	const connectionAttemptDelay = 250 * time.Millisecond
+
+	// Build ordered endpoint list: IPv6 first, then IPv4.
+	var endpoints []taggedEndpoint
+	if ip := net.ParseIP(endpointV6); ip != nil {
+		endpoints = append(endpoints, taggedEndpoint{&net.UDPAddr{IP: ip, Port: connectPort}, "IPv6"})
+	}
+	if ip := net.ParseIP(endpointV4); ip != nil {
+		endpoints = append(endpoints, taggedEndpoint{&net.UDPAddr{IP: ip, Port: connectPort}, "IPv4"})
+	}
+
+	if len(endpoints) == 0 {
+		return nil, nil, nil, nil, errors.New("no valid endpoints configured")
+	}
+
+	// Single endpoint — no racing needed.
+	if len(endpoints) == 1 {
+		ep := endpoints[0]
+		log.Printf("Connecting to %s (%s)", ep.addr, ep.tag)
+		udpConn, tr, ipConn, rsp, err := connectTunnelProtected(ctx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
+		if err != nil {
+			if udpConn != nil {
+				udpConn.Close()
+			}
+			return nil, nil, nil, nil, err
+		}
+		return udpConn, tr, ipConn, rsp, nil
+	}
+
+	// Dual-stack: race with staggered start.
+	raceCtx, raceCancel := context.WithCancel(ctx)
+	defer raceCancel()
+
+	ch := make(chan connResult, 2)
+
+	attempt := func(ep taggedEndpoint) {
+		log.Printf("Connecting to %s (%s)", ep.addr, ep.tag)
+		udpConn, tr, ipConn, rsp, err := connectTunnelProtected(raceCtx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
+		r := connResult{udpConn: udpConn, tr: tr, ipConn: ipConn, rsp: rsp, err: err, tag: ep.tag}
+		// Treat non-200 as failure for racing purposes.
+		if err == nil && rsp.StatusCode != 200 {
+			r.err = fmt.Errorf("tunnel rejected: %s", rsp.Status)
+		}
+		ch <- r
+	}
+
+	// Start first attempt (IPv6) immediately.
+	go attempt(endpoints[0])
+
+	// Wait for delay or first failure before starting second attempt.
+	timer := time.NewTimer(connectionAttemptDelay)
+	defer timer.Stop()
+
+	select {
+	case r := <-ch:
+		if r.err == nil {
+			// First attempt won — no need to start second.
+			return r.udpConn, r.tr, r.ipConn, r.rsp, nil
+		}
+		// First attempt failed — start fallback immediately.
+		log.Printf("%s failed: %v", r.tag, r.err)
+		if r.udpConn != nil {
+			r.udpConn.Close()
+		}
+		go attempt(endpoints[1])
+	case <-timer.C:
+		// Delay expired — start second attempt in parallel.
+		go attempt(endpoints[1])
+	case <-ctx.Done():
+		return nil, nil, nil, nil, ctx.Err()
+	}
+
+	// Collect results: up to 2 attempts may be in flight.
+	var lastErr error
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-ch:
+			if r.err == nil {
+				// Winner — cancel the other attempt and return.
+				raceCancel()
+				return r.udpConn, r.tr, r.ipConn, r.rsp, nil
+			}
+			log.Printf("%s failed: %v", r.tag, r.err)
+			if r.udpConn != nil {
+				r.udpConn.Close()
+			}
+			lastErr = r.err
+		case <-ctx.Done():
+			return nil, nil, nil, nil, ctx.Err()
+		}
+	}
+	return nil, nil, nil, nil, lastErr
 }
 
 // connectTunnelProtected mirrors api.ConnectTunnel but protects the UDP

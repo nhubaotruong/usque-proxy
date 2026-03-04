@@ -26,6 +26,13 @@ class VpnTileService : TileService() {
         updateTile()
     }
 
+    fun onTileLongClick() {
+        val intent = Intent(this, MainActivity::class.java).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        collapseAndStartActivity(intent)
+    }
+
     override fun onClick() {
         super.onClick()
         val tile = qsTile ?: return
