@@ -28,12 +28,9 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
-        with:
-          packages: |
-            platforms;android-36
-            platforms;android-31
-            build-tools;36.0.0
-            ndk;28.0.13004108
+
+      - name: Install SDK packages
+        run: sdkmanager "platforms;android-36" "platforms;android-31" "build-tools;36.0.0" "ndk;28.0.13004108"
 
       - name: Install gomobile
         run: |
