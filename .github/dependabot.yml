@@ -17,3 +17,6 @@ updates:
   - package-ecosystem: "gomod" # See documentation for possible values
     directory: "/usque-bind" # Location of package manifests
     multi-ecosystem-group: "infrastructure"
+  - package-ecosystem: "github-actions" # See documentation for possible values
+    directory: "/" # Location of package manifests
+    multi-ecosystem-group: "infrastructure"
