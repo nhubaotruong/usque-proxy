@@ -7,7 +7,7 @@ toolchain go1.24.2
 require (
 	github.com/Diniboy1123/connect-ip-go v0.0.0-20251011145655-7be32d5976d9
 	github.com/Diniboy1123/usque v1.4.2
-	github.com/quic-go/quic-go v0.57.0
+	github.com/quic-go/quic-go v0.59.0
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	golang.org/x/mobile v0.0.0-20250408133729-978277e7eaf7
 )
