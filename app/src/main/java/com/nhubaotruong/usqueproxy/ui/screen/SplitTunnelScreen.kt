@@ -14,6 +14,10 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
@@ -41,6 +45,7 @@ import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnViewModel
 fun SplitTunnelScreen(viewModel: VpnViewModel) {
     val prefs by viewModel.vpnPrefs.collectAsState()
     val apps by viewModel.installedApps.collectAsState()
+    val needsRestart by viewModel.needsRestart.collectAsState()
     var searchQuery by remember { mutableStateOf("") }
 
     LaunchedEffect(prefs.splitMode) {
@@ -55,6 +60,41 @@ fun SplitTunnelScreen(viewModel: VpnViewModel) {
             .padding(horizontal = 16.dp),
         verticalArrangement = Arrangement.spacedBy(4.dp),
     ) {
+        if (needsRestart) {
+            item {
+                Card(
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.tertiaryContainer,
+                    ),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "Restart to apply changes",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onTertiaryContainer,
+                        )
+                        Button(
+                            onClick = { viewModel.restartVpn() },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = MaterialTheme.colorScheme.tertiary,
+                                contentColor = MaterialTheme.colorScheme.onTertiary,
+                            ),
+                        ) {
+                            Text("Restart now")
+                        }
+                    }
+                }
+                Spacer(Modifier.height(4.dp))
+            }
+        }
+
         item {
             Text(
                 "Split Tunneling",

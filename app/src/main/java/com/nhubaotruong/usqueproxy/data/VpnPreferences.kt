@@ -19,6 +19,7 @@ data class VpnPrefs(
     val includedApps: Set<String> = emptySet(),
     val excludedApps: Set<String> = emptySet(),
     val bypassLocalNetwork: Boolean = true,
+    val bypassOffice365: Boolean = false,
     val isMetered: Boolean = false,
     val dnsMode: DnsMode = DnsMode.SYSTEM,
     val dohUrl: String = "",
@@ -54,6 +55,7 @@ class VpnPreferences(private val context: Context) {
         val INCLUDED_APPS = stringSetPreferencesKey("included_apps")
         val EXCLUDED_APPS = stringSetPreferencesKey("excluded_apps")
         val BYPASS_LOCAL = booleanPreferencesKey("bypass_local")
+        val BYPASS_OFFICE365 = booleanPreferencesKey("bypass_office365")
         val IS_METERED = booleanPreferencesKey("is_metered")
         val USE_SYSTEM_DNS = booleanPreferencesKey("use_system_dns") // legacy, for migration
         val DNS_MODE = stringPreferencesKey("dns_mode")
@@ -86,6 +88,7 @@ class VpnPreferences(private val context: Context) {
                 ?: p[Keys.SELECTED_APPS] ?: emptySet(),
             excludedApps = p[Keys.EXCLUDED_APPS] ?: emptySet(),
             bypassLocalNetwork = p[Keys.BYPASS_LOCAL] ?: true,
+            bypassOffice365 = p[Keys.BYPASS_OFFICE365] ?: false,
             isMetered = p[Keys.IS_METERED] ?: false,
             dnsMode = p[Keys.DNS_MODE]?.let {
                 runCatching { DnsMode.valueOf(it) }.getOrDefault(DnsMode.SYSTEM)
@@ -123,6 +126,10 @@ class VpnPreferences(private val context: Context) {
 
     suspend fun setBypassLocalNetwork(bypass: Boolean) {
         context.dataStore.edit { it[Keys.BYPASS_LOCAL] = bypass }
+    }
+
+    suspend fun setBypassOffice365(bypass: Boolean) {
+        context.dataStore.edit { it[Keys.BYPASS_OFFICE365] = bypass }
     }
 
     suspend fun setMetered(metered: Boolean) {

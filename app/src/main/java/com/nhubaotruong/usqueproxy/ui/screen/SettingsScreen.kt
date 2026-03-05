@@ -217,6 +217,9 @@ fun SettingsScreen(viewModel: VpnViewModel) {
             SwitchRow("Bypass local network", prefs.bypassLocalNetwork) {
                 viewModel.setBypassLocalNetwork(it)
             }
+            SwitchRow("Bypass Microsoft Office 365", prefs.bypassOffice365) {
+                viewModel.setBypassOffice365(it)
+            }
             SwitchRow("Metered connection", prefs.isMetered) {
                 viewModel.setMetered(it)
             }

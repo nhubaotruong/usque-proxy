@@ -279,6 +279,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { prefs.setBypassLocalNetwork(bypass) }
     }
 
+    fun setBypassOffice365(bypass: Boolean) {
+        markRestartNeeded()
+        viewModelScope.launch { prefs.setBypassOffice365(bypass) }
+    }
+
     fun setMetered(metered: Boolean) {
         markRestartNeeded()
         viewModelScope.launch { prefs.setMetered(metered) }
