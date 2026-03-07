@@ -299,6 +299,11 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { prefs.setDohUrl(url) }
     }
 
+    fun setPreventDnsLeak(prevent: Boolean) {
+        markRestartNeeded()
+        viewModelScope.launch { prefs.setPreventDnsLeak(prevent) }
+    }
+
     fun setCustomSni(sni: String) {
         markRestartNeeded()
         viewModelScope.launch { prefs.setCustomSni(sni) }

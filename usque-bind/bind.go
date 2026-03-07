@@ -58,9 +58,11 @@ type connResult struct {
 // tunnelConfig extends config.Config with optional tunnel parameters.
 type tunnelConfig struct {
 	config.Config
-	SNI        string `json:"sni"`
-	ConnectURI string `json:"connect_uri"`
-	DoHURL     string `json:"doh_url"`
+	SNI            string   `json:"sni"`
+	ConnectURI     string   `json:"connect_uri"`
+	DoHURL         string   `json:"doh_url"`
+	PreventDnsLeak bool     `json:"prevent_dns_leak"`
+	DnsServers     []string `json:"dns_servers"`
 }
 
 func (t *tunnelConfig) sni() string {
@@ -388,11 +390,14 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 	pool := api.NewNetBuffer(mtu)
 
-	// Create DoH proxy if configured
-	var doh *dohProxy
-	if cfg.DoHURL != "" {
-		doh = newDohProxy(cfg.DoHURL, protector)
-		log.Printf("DoH proxy enabled: %s", cfg.DoHURL)
+	// Create DNS interceptor
+	dns := newDnsInterceptor(cfg, protector)
+	if dns != nil {
+		if dns.interceptAll {
+			log.Println("DNS interception enabled: all port 53 traffic")
+		} else {
+			log.Println("DNS interception enabled: virtual DNS IP only")
+		}
 	}
 
 	// Certificate cache: generate once, reuse until near expiry.
@@ -458,7 +463,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		backoff = minBackoff
 		log.Println("Connected to MASQUE server")
 		errChan := make(chan error, 2)
-		go forwardUp(device, ipConn, pool, errChan, doh)
+		go forwardUp(device, ipConn, pool, errChan, dns)
 		go forwardDown(device, ipConn, pool, errChan)
 
 		select {
@@ -655,7 +660,7 @@ func connectTunnelProtected(
 	return udpConn, tr, ipConn, rsp, nil
 }
 
-func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, doh *dohProxy) {
+func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor) {
 	for {
 		buf := pool.Get()
 		n, err := device.ReadPacket(buf)
@@ -667,14 +672,24 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 		pkt := buf[:n]
 		txBytes.Add(int64(n))
 
-		// Intercept DNS packets destined for the virtual DNS IP
-		if doh != nil {
-			if srcIP, srcPort, query, ok := isDNSPacket(pkt); ok {
-				queryCopy := make([]byte, len(query))
-				copy(queryCopy, query)
-				pool.Put(buf)
-				go doh.handleDNSPacket(srcIP, srcPort, queryCopy, device.WritePacket)
-				continue
+		// Intercept DNS packets
+		if dns != nil {
+			if dns.interceptAll {
+				if srcIP, srcPort, dstIP, query, ok := isAnyDNSPacket(pkt); ok {
+					queryCopy := make([]byte, len(query))
+					copy(queryCopy, query)
+					pool.Put(buf)
+					go dns.handleInterceptedDNS(srcIP, srcPort, dstIP, queryCopy, device.WritePacket)
+					continue
+				}
+			} else {
+				if srcIP, srcPort, query, ok := isDNSPacket(pkt); ok {
+					queryCopy := make([]byte, len(query))
+					copy(queryCopy, query)
+					pool.Put(buf)
+					go dns.handleInterceptedDNS(srcIP, srcPort, net.ParseIP(virtualDNSIP).To4(), queryCopy, device.WritePacket)
+					continue
+				}
 			}
 		}
 

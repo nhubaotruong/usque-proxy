@@ -26,6 +26,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 import org.json.JSONObject
 import usquebind.Usquebind
 import usquebind.VpnProtector
@@ -117,15 +118,26 @@ class UsqueVpnService : VpnService() {
                 val dns = getSystemDnsServers()
                 Log.d(TAG, "Using system DNS: $dns")
                 dns.forEach { builder.addDnsServer(it) }
+                if (prefs.preventDnsLeak) {
+                    config.put("prevent_dns_leak", true)
+                    config.put("dns_servers", JSONArray(dns))
+                }
             }
             DnsMode.CLOUDFLARE -> {
                 builder.addDnsServer("1.1.1.1")
                 builder.addDnsServer("2606:4700:4700::1111")
+                if (prefs.preventDnsLeak) {
+                    config.put("prevent_dns_leak", true)
+                    config.put("doh_url", "https://cloudflare-dns.com/dns-query")
+                }
             }
             DnsMode.CUSTOM_DOH -> {
                 builder.addDnsServer("10.255.255.53")
                 builder.addRoute("10.255.255.53", 32)
                 config.put("doh_url", prefs.dohUrl)
+                if (prefs.preventDnsLeak) {
+                    config.put("prevent_dns_leak", true)
+                }
             }
         }
 

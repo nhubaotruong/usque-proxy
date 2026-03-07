@@ -224,6 +224,17 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                     singleLine = true,
                 )
             }
+            SwitchRow("Prevent DNS leaks", prefs.preventDnsLeak) {
+                viewModel.setPreventDnsLeak(it)
+            }
+            if (prefs.preventDnsLeak && prefs.dnsMode == DnsMode.SYSTEM) {
+                Text(
+                    "Enable Private DNS in system settings for encrypted DNS",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 4.dp),
+                )
+            }
             HorizontalDivider()
         }
 
