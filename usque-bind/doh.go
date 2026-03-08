@@ -1,8 +1,9 @@
 package usquebind
 
 import (
-	"bytes"
 	"context"
+	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 const virtualDNSIPStr = "10.255.255.53"
@@ -26,10 +29,12 @@ var dnsResponsePool = sync.Pool{
 
 // dohProxy resolves DNS queries over HTTPS (RFC 8484).
 type dohProxy struct {
-	url       string
-	client    *http.Client
-	protector VpnProtector
-	cache     sync.Map // query content -> *cacheEntry
+	url        string
+	client     *http.Client
+	clientMu   sync.Mutex           // protects client recreation
+	protector  VpnProtector
+	cache      sync.Map             // query content -> *cacheEntry
+	makeClient func() *http.Client  // factory for recreating client on network errors
 }
 
 type cacheEntry struct {
@@ -38,36 +43,54 @@ type cacheEntry struct {
 }
 
 func newDohProxy(url string, protector VpnProtector) *dohProxy {
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	transport := &http.Transport{
-		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        0,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 10 * time.Second,
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := dialer.DialContext(ctx, network, addr)
-			if err != nil {
-				return nil, err
-			}
-			// Protect the socket from VPN routing
-			if tc, ok := conn.(*net.TCPConn); ok {
-				raw, err := tc.SyscallConn()
-				if err == nil {
-					raw.Control(func(fd uintptr) {
-						protector.ProtectFd(int(fd))
-					})
+	makeClient := func() *http.Client {
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
+		transport := &http.Transport{
+			ForceAttemptHTTP2:   true,
+			DisableCompression:  true,
+			MaxConnsPerHost:     2,
+			MaxIdleConns:        2,
+			MaxIdleConnsPerHost: 2,
+			IdleConnTimeout:     5 * time.Minute,
+			TLSHandshakeTimeout: 5 * time.Second,
+			TLSClientConfig: &tls.Config{
+				ClientSessionCache: tls.NewLRUClientSessionCache(0),
+			},
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				conn, err := dialer.DialContext(ctx, network, addr)
+				if err != nil {
+					return nil, err
 				}
-			}
-			return conn, nil
-		},
-	}
-	return &dohProxy{
-		url:       url,
-		protector: protector,
-		client: &http.Client{
+				// Protect the socket from VPN routing
+				if tc, ok := conn.(*net.TCPConn); ok {
+					raw, err := tc.SyscallConn()
+					if err == nil {
+						raw.Control(func(fd uintptr) {
+							protector.ProtectFd(int(fd))
+						})
+					}
+				}
+				return conn, nil
+			},
+		}
+
+		// Explicitly configure HTTP/2 with idle connection pinging
+		h2transport, err := http2.ConfigureTransports(transport)
+		if err == nil {
+			h2transport.ReadIdleTimeout = 30 * time.Second
+		}
+
+		return &http.Client{
 			Transport: transport,
-			Timeout:   10 * time.Second,
-		},
+			Timeout:   7 * time.Second,
+		}
+	}
+
+	return &dohProxy{
+		url:        url,
+		protector:  protector,
+		client:     makeClient(),
+		makeClient: makeClient,
 	}
 }
 
@@ -83,15 +106,21 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 		d.cache.Delete(cacheKey)
 	}
 
-	req, err := http.NewRequest("POST", d.url, bytes.NewReader(query))
+	// RFC 8484: Use GET with base64url-encoded query for cache friendliness
+	encoded := base64.RawURLEncoding.EncodeToString(query)
+	reqURL := d.url + "?dns=" + encoded
+	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/dns-message")
 	req.Header.Set("Accept", "application/dns-message")
 
 	resp, err := d.client.Do(req)
 	if err != nil {
+		// On timeout/network errors, reset the client for next request
+		if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+			d.resetClient()
+		}
 		return nil, err
 	}
 	defer resp.Body.Close()
@@ -113,6 +142,13 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 	})
 
 	return body, nil
+}
+
+// resetClient recreates the HTTP client, discarding stale connections.
+func (d *dohProxy) resetClient() {
+	d.clientMu.Lock()
+	defer d.clientMu.Unlock()
+	d.client = d.makeClient()
 }
 
 // isDNSPacket checks if pkt is an IPv4 UDP packet destined for the virtual DNS IP on port 53.
@@ -285,20 +321,23 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 		closeFunc:    closeFunc,
 	}
 
-	// Dispatch goroutine: spawn a new goroutine per DNS request for maximum parallelism.
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case req, ok := <-d.reqCh:
-				if !ok {
+	// Bounded worker pool for DNS resolution.
+	const numWorkers = 8
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
 					return
+				case req, ok := <-d.reqCh:
+					if !ok {
+						return
+					}
+					d.handleInterceptedDNS(req)
 				}
-				go d.handleInterceptedDNS(req)
 			}
-		}
-	}()
+		}()
+	}
 
 	// Start cache eviction
 	for _, c := range caches {
