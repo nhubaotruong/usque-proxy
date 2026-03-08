@@ -41,7 +41,7 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	transport := &http.Transport{
 		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        2,
+		MaxIdleConns:        0,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 10 * time.Second,
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -281,15 +281,24 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 	d := &dnsInterceptor{
 		resolver:     resolver,
 		interceptAll: interceptAll,
-		reqCh:        make(chan dnsRequest, 64),
+		reqCh:        make(chan dnsRequest, 256),
 		closeFunc:    closeFunc,
 	}
 
-	// Start bounded worker pool
-	const numWorkers = 4
-	for i := 0; i < numWorkers; i++ {
-		go d.worker(ctx)
-	}
+	// Dispatch goroutine: spawn a new goroutine per DNS request for maximum parallelism.
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case req, ok := <-d.reqCh:
+				if !ok {
+					return
+				}
+				go d.handleInterceptedDNS(req)
+			}
+		}
+	}()
 
 	// Start cache eviction
 	for _, c := range caches {
@@ -297,21 +306,6 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 	}
 
 	return d
-}
-
-// worker processes DNS requests from the channel until ctx is cancelled.
-func (d *dnsInterceptor) worker(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case req, ok := <-d.reqCh:
-			if !ok {
-				return
-			}
-			d.handleInterceptedDNS(req)
-		}
-	}
 }
 
 // forwardUp queues a DNS request for processing. Drops the request if the queue is full.
@@ -382,8 +376,8 @@ func buildDNSResponseIPv4(buf []byte, responseIP, dstIP net.IP, dstPort uint16, 
 	binary.BigEndian.PutUint16(pkt[10:12], ipChecksum(pkt[:20]))
 
 	// UDP header
-	binary.BigEndian.PutUint16(pkt[20:22], 53)            // src port
-	binary.BigEndian.PutUint16(pkt[22:24], dstPort)        // dst port
+	binary.BigEndian.PutUint16(pkt[20:22], 53)      // src port
+	binary.BigEndian.PutUint16(pkt[22:24], dstPort) // dst port
 	binary.BigEndian.PutUint16(pkt[24:26], uint16(udpLen))
 	pkt[26] = 0 // UDP checksum = 0 (optional for IPv4)
 	pkt[27] = 0
@@ -407,8 +401,8 @@ func buildDNSResponseIPv6(buf []byte, responseIP, dstIP net.IP, dstPort uint16, 
 	pkt[2] = 0
 	pkt[3] = 0
 	binary.BigEndian.PutUint16(pkt[4:6], uint16(udpLen)) // payload length
-	pkt[6] = 17 // Next Header = UDP
-	pkt[7] = 64 // Hop Limit
+	pkt[6] = 17                                          // Next Header = UDP
+	pkt[7] = 64                                          // Hop Limit
 	// Source IP (16 bytes)
 	copy(pkt[8:24], responseIP.To16())
 	// Destination IP (16 bytes)
@@ -416,8 +410,8 @@ func buildDNSResponseIPv6(buf []byte, responseIP, dstIP net.IP, dstPort uint16, 
 
 	// UDP header
 	udp := pkt[40:]
-	binary.BigEndian.PutUint16(udp[0:2], 53)            // src port
-	binary.BigEndian.PutUint16(udp[2:4], dstPort)        // dst port
+	binary.BigEndian.PutUint16(udp[0:2], 53)      // src port
+	binary.BigEndian.PutUint16(udp[2:4], dstPort) // dst port
 	binary.BigEndian.PutUint16(udp[4:6], uint16(udpLen))
 	udp[6] = 0 // checksum placeholder
 	udp[7] = 0
