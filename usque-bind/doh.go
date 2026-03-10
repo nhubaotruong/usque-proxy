@@ -38,13 +38,23 @@ type dohProxy struct {
 	clientMu   sync.Mutex           // protects client recreation
 	protector  VpnProtector
 	cache      sync.Map             // query content -> *cacheEntry
+	refreshing sync.Map             // cache keys currently being background-refreshed
 	makeClient func() *http.Client  // factory for recreating client on network errors
 	preferGET  bool                 // flip to true on HTTP 405, stay on GET
 }
 
 type cacheEntry struct {
-	response []byte
-	expiry   time.Time
+	response      []byte
+	expiry        time.Time
+	staleDeadline time.Time
+}
+
+const staleGracePeriod = 5 * time.Minute
+
+// warmupQuery is a minimal DNS query for "." (root) NS record, used to pre-warm the connection.
+var warmupQuery = []byte{
+	0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00,
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01,
 }
 
 func newDohProxy(url string, protector VpnProtector) *dohProxy {
@@ -115,18 +125,60 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 	cacheKey := string(query)
 	if v, ok := d.cache.Load(cacheKey); ok {
 		entry := v.(*cacheEntry)
-		if time.Now().Before(entry.expiry) {
-			// Return copy with caller's transaction ID
+		now := time.Now()
+		if now.Before(entry.expiry) {
+			// Fresh hit — return immediately
 			resp := make([]byte, len(entry.response))
 			copy(resp, entry.response)
 			resp[0], resp[1] = origID[0], origID[1]
 			query[0], query[1] = origID[0], origID[1]
 			return resp, nil
 		}
+		if now.Before(entry.staleDeadline) {
+			// Stale hit — return immediately, refresh in background
+			resp := make([]byte, len(entry.response))
+			copy(resp, entry.response)
+			resp[0], resp[1] = origID[0], origID[1]
+			query[0], query[1] = origID[0], origID[1]
+			// Trigger background refresh (deduped by cache key)
+			if _, loaded := d.refreshing.LoadOrStore(cacheKey, struct{}{}); !loaded {
+				queryCopy := make([]byte, len(query))
+				copy(queryCopy, query)
+				queryCopy[0], queryCopy[1] = 0, 0
+				go d.backgroundRefresh(cacheKey, queryCopy)
+			}
+			return resp, nil
+		}
+		// Fully expired — delete and fall through to network fetch
 		d.cache.Delete(cacheKey)
 	}
 
-	// Pad query with EDNS0 padding (128-byte blocks) for the wire
+	body, err := d.fetchFromServer(query)
+	if err != nil {
+		query[0], query[1] = origID[0], origID[1]
+		return nil, err
+	}
+
+	// Cache with zeroed transaction ID
+	cacheCopy := make([]byte, len(body))
+	copy(cacheCopy, body)
+	cacheCopy[0], cacheCopy[1] = 0, 0
+	ttl := extractMinTTL(body)
+	now := time.Now()
+	d.cache.Store(cacheKey, &cacheEntry{
+		response:      cacheCopy,
+		expiry:        now.Add(ttl),
+		staleDeadline: now.Add(ttl + staleGracePeriod),
+	})
+
+	// Patch caller's original ID into response
+	body[0], body[1] = origID[0], origID[1]
+	query[0], query[1] = origID[0], origID[1]
+	return body, nil
+}
+
+// fetchFromServer sends a DNS query to the DoH server with retries and returns the raw response.
+func (d *dohProxy) fetchFromServer(query []byte) ([]byte, error) {
 	padded := padQuery(query)
 
 	const maxRetries = 3
@@ -141,7 +193,6 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 			req, err = d.buildPOSTRequest(padded)
 		}
 		if err != nil {
-			query[0], query[1] = origID[0], origID[1]
 			return nil, err
 		}
 
@@ -157,7 +208,6 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 				}
 				continue
 			}
-			query[0], query[1] = origID[0], origID[1]
 			return nil, err
 		}
 
@@ -171,41 +221,53 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 	}
 
 	if resp == nil {
-		query[0], query[1] = origID[0], origID[1]
 		return nil, fmt.Errorf("DoH request failed after retries: %v", lastErr)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		query[0], query[1] = origID[0], origID[1]
 		return nil, errors.New("DoH server returned " + resp.Status)
 	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
-		query[0], query[1] = origID[0], origID[1]
 		return nil, err
 	}
 
 	if len(body) < 2 {
-		query[0], query[1] = origID[0], origID[1]
 		return nil, errors.New("DoH response too short")
 	}
 
-	// Cache with zeroed transaction ID
+	return body, nil
+}
+
+// backgroundRefresh fetches a fresh response for the given cache key and updates the cache.
+func (d *dohProxy) backgroundRefresh(cacheKey string, query []byte) {
+	defer d.refreshing.Delete(cacheKey)
+
+	body, err := d.fetchFromServer(query)
+	if err != nil {
+		log.Printf("DNS background refresh error: %v", err)
+		return
+	}
+
 	cacheCopy := make([]byte, len(body))
 	copy(cacheCopy, body)
 	cacheCopy[0], cacheCopy[1] = 0, 0
 	ttl := extractMinTTL(body)
+	now := time.Now()
 	d.cache.Store(cacheKey, &cacheEntry{
-		response: cacheCopy,
-		expiry:   time.Now().Add(ttl),
+		response:      cacheCopy,
+		expiry:        now.Add(ttl),
+		staleDeadline: now.Add(ttl + staleGracePeriod),
 	})
+}
 
-	// Patch caller's original ID into response
-	body[0], body[1] = origID[0], origID[1]
-	query[0], query[1] = origID[0], origID[1]
-	return body, nil
+// warmConnection pre-establishes the TCP+TLS+HTTP/2 connection by sending a root NS query.
+func (d *dohProxy) warmConnection() {
+	go func() {
+		_, _ = d.fetchFromServer(warmupQuery)
+	}()
 }
 
 func (d *dohProxy) buildPOSTRequest(query []byte) (*http.Request, error) {
@@ -556,6 +618,7 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 
 	if cfg.DoHURL != "" {
 		doh := newDohProxy(cfg.DoHURL, protector)
+		doh.warmConnection()
 		resolver = doh.resolve
 		interceptAll = cfg.PreventDnsLeak
 		caches = append(caches, &doh.cache)
@@ -991,7 +1054,11 @@ func startCacheEvictor(ctx context.Context, cache *sync.Map, interval time.Durat
 				now := time.Now()
 				cache.Range(func(key, value any) bool {
 					if entry, ok := value.(*cacheEntry); ok {
-						if now.After(entry.expiry) {
+						deadline := entry.staleDeadline
+					if deadline.IsZero() {
+						deadline = entry.expiry
+					}
+					if now.After(deadline) {
 							cache.Delete(key)
 						}
 					}
