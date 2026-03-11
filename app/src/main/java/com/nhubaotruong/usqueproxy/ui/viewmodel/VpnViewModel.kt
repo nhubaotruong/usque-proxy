@@ -283,6 +283,10 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch { prefs.setConnectUri(uri) }
     }
 
+    fun setAutoConnect(enabled: Boolean) {
+        viewModelScope.launch { prefs.setAutoConnect(enabled) }
+    }
+
     fun setThemeMode(mode: ThemeMode) {
         viewModelScope.launch { prefs.setThemeMode(mode) }
     }

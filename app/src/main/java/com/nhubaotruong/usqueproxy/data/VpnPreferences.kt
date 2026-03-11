@@ -31,6 +31,7 @@ data class VpnPrefs(
     val isZtRegistered: Boolean = false,
     val customSni: String = "",
     val connectUri: String = "",
+    val autoConnect: Boolean = false,
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
 ) {
     val activeConfigJson: String
@@ -73,6 +74,7 @@ class VpnPreferences(private val context: Context) {
         val IS_ZT_REGISTERED = booleanPreferencesKey("is_zt_registered")
         val CUSTOM_SNI = stringPreferencesKey("custom_sni")
         val CONNECT_URI = stringPreferencesKey("connect_uri")
+        val AUTO_CONNECT = booleanPreferencesKey("auto_connect")
         val THEME_MODE = stringPreferencesKey("theme_mode")
     }
 
@@ -108,6 +110,7 @@ class VpnPreferences(private val context: Context) {
             isWarpRegistered = isWarpReg,
             ztConfigJson = p[Keys.ZT_CONFIG_JSON] ?: "",
             isZtRegistered = p[Keys.IS_ZT_REGISTERED] ?: false,
+            autoConnect = p[Keys.AUTO_CONNECT] ?: false,
             customSni = p[Keys.CUSTOM_SNI] ?: "",
             connectUri = p[Keys.CONNECT_URI] ?: "",
             themeMode = runCatching { ThemeMode.valueOf(p[Keys.THEME_MODE] ?: "SYSTEM") }
@@ -189,6 +192,10 @@ class VpnPreferences(private val context: Context) {
 
     suspend fun setConnectUri(uri: String) {
         context.dataStore.edit { it[Keys.CONNECT_URI] = uri }
+    }
+
+    suspend fun setAutoConnect(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.AUTO_CONNECT] = enabled }
     }
 
     suspend fun setThemeMode(mode: ThemeMode) {

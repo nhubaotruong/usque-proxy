@@ -466,8 +466,10 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		backoff = minBackoff
 		log.Println("Connected to MASQUE server")
 		errChan := make(chan error, 2)
-		go forwardUp(device, ipConn, pool, errChan, dns)
-		go forwardDown(device, ipConn, pool, errChan)
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns) }()
+		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan) }()
 
 		select {
 		case err = <-errChan:
@@ -479,6 +481,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		}
 
 		cleanup(ipConn, udpConn, tr)
+		wg.Wait() // wait for forwarding goroutines to exit before reconnecting
 		if ctx.Err() != nil {
 			return nil
 		}
@@ -716,11 +719,8 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 		icmp, err := ipConn.WritePacket(pkt)
 		pool.Put(buf)
 		if err != nil {
-			if errors.As(err, new(*connectip.CloseError)) {
-				errChan <- err
-				return
-			}
-			continue
+			errChan <- err
+			return
 		}
 		if len(icmp) > 0 {
 			_ = device.WritePacket(icmp)
@@ -734,11 +734,8 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetB
 	for {
 		n, err := ipConn.ReadPacket(buf, true)
 		if err != nil {
-			if errors.As(err, new(*connectip.CloseError)) {
-				errChan <- err
-				return
-			}
-			continue
+			errChan <- err
+			return
 		}
 		rxBytes.Add(int64(n))
 		if err := device.WritePacket(buf[:n]); err != nil {

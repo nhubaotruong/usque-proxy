@@ -187,6 +187,9 @@ fun SettingsScreen(viewModel: VpnViewModel) {
         // Network section
         item {
             SectionHeader("Network")
+            SwitchRow("Connect on startup", prefs.autoConnect) {
+                viewModel.setAutoConnect(it)
+            }
             SwitchRow("Bypass local network", prefs.bypassLocalNetwork) {
                 viewModel.setBypassLocalNetwork(it)
             }
