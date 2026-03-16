@@ -607,6 +607,7 @@ type dnsInterceptor struct {
 	interceptAll bool // true = intercept all port 53 traffic, false = only virtualDNSIP
 	reqCh        chan dnsRequest
 	closeFunc    func() // called on shutdown to close pooled connections
+	resetFunc    func() // called on network change to discard stale connections
 }
 
 // newDnsInterceptor creates a dnsInterceptor based on the tunnel config.
@@ -616,17 +617,24 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 	var closeFunc func()
 	var caches []*sync.Map
 
+	var resetFunc func()
+
 	if cfg.DoHURL != "" {
 		doh := newDohProxy(cfg.DoHURL, protector)
 		doh.warmConnection()
 		resolver = doh.resolve
 		interceptAll = cfg.PreventDnsLeak
 		caches = append(caches, &doh.cache)
+		resetFunc = func() {
+			doh.resetClient()
+			doh.warmConnection()
+		}
 	} else if cfg.PreventDnsLeak && len(cfg.DnsServers) > 0 {
 		plain := newPlainDnsProxy(cfg.DnsServers, protector)
 		resolver = plain.resolve
 		interceptAll = true
 		closeFunc = plain.close
+		resetFunc = plain.resetConnections
 		caches = append(caches, &plain.cache)
 	} else {
 		return nil
@@ -637,6 +645,7 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 		interceptAll: interceptAll,
 		reqCh:        make(chan dnsRequest, 256),
 		closeFunc:    closeFunc,
+		resetFunc:    resetFunc,
 	}
 
 	// Bounded worker pool for DNS resolution.
@@ -678,6 +687,13 @@ func (d *dnsInterceptor) forwardUp(req dnsRequest) {
 func (d *dnsInterceptor) close() {
 	if d.closeFunc != nil {
 		d.closeFunc()
+	}
+}
+
+// resetConnections discards stale DNS connections after a network change.
+func (d *dnsInterceptor) resetConnections() {
+	if d.resetFunc != nil {
+		d.resetFunc()
 	}
 }
 
@@ -894,6 +910,21 @@ func (p *plainDnsProxy) close() {
 		}
 		sc.mu.Unlock()
 		delete(p.conns, server)
+	}
+}
+
+// resetConnections closes all pooled UDP connections so they are lazily
+// recreated on the next query, bound to the new network's socket.
+func (p *plainDnsProxy) resetConnections() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, sc := range p.conns {
+		sc.mu.Lock()
+		if sc.conn != nil {
+			sc.conn.Close()
+			sc.conn = nil
+		}
+		sc.mu.Unlock()
 	}
 }
 

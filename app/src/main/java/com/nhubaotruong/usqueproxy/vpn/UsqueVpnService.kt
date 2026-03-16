@@ -302,7 +302,10 @@ class UsqueVpnService : VpnService() {
                 Log.i(TAG, "Default network lost: $network")
                 if (currentNetwork == network) {
                     currentNetwork = null
-                    if (isRunning) setUnderlyingNetworks(null)
+                    if (isRunning) {
+                        setUnderlyingNetworks(null)
+                        restartTunnel()
+                    }
                 }
             }
 

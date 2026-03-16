@@ -147,6 +147,7 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	done = make(chan struct{})
 	reconnectCh = make(chan struct{}, 1)
 	running.Store(true)
+	networkTriggered.Store(false)
 	startTime = time.Now()
 	txBytes.Store(0)
 	rxBytes.Store(0)
@@ -171,9 +172,14 @@ func StopTunnel() {
 	}
 }
 
+// networkTriggered is set by Reconnect() to signal that the reconnect was
+// caused by a network change, so maintainTunnel can skip the initial backoff.
+var networkTriggered atomic.Bool
+
 // Reconnect tears down the current QUIC connection but keeps the reconnect
 // loop alive so it re-establishes on the (possibly new) network.
 func Reconnect() {
+	networkTriggered.Store(true)
 	mu.Lock()
 	ch := reconnectCh
 	mu.Unlock()
@@ -405,7 +411,10 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	var cachedCert [][]byte
 	var certExpiry time.Time
 
+	const networkGraceMax = 3 // attempts at minBackoff after network change before escalating
+
 	backoff := minBackoff
+	networkGraceAttempts := 0
 
 	for {
 		select {
@@ -471,12 +480,19 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns) }()
 		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan) }()
 
+		isNetworkReconnect := false
 		select {
 		case err = <-errChan:
 			log.Printf("tunnel lost: %v", err)
 		case <-reconnectCh:
 			log.Println("reconnect requested")
-			backoff = minBackoff // reset backoff — this is expected, not a failure
+			if networkTriggered.Swap(false) {
+				isNetworkReconnect = true
+				backoff = 0
+				networkGraceAttempts = networkGraceMax
+			} else {
+				backoff = minBackoff
+			}
 		case <-ctx.Done():
 		}
 
@@ -485,8 +501,21 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		if ctx.Err() != nil {
 			return nil
 		}
-		sleepCtx(ctx, backoff)
-		backoff = nextBackoff(backoff, maxBackoff)
+
+		// Reset DNS connections on network change so stale sockets are discarded
+		if isNetworkReconnect && dns != nil {
+			dns.resetConnections()
+		}
+
+		if backoff > 0 {
+			sleepCtx(ctx, backoff)
+		}
+		if networkGraceAttempts > 0 {
+			networkGraceAttempts--
+			backoff = minBackoff // hold at minBackoff during grace period
+		} else {
+			backoff = nextBackoff(backoff, maxBackoff)
+		}
 	}
 }
 
