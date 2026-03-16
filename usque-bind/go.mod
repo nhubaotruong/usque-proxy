@@ -1,6 +1,6 @@
 module usquebind
 
-go 1.25.0
+go 1.24.2
 
 require (
 	github.com/Diniboy1123/connect-ip-go v0.0.0-20251011145655-7be32d5976d9
