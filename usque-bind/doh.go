@@ -19,7 +19,7 @@ import (
 )
 
 // globalTLSSessionCache is shared across all DoH clients to survive client resets.
-var globalTLSSessionCache = tls.NewLRUClientSessionCache(64)
+var globalTLSSessionCache = tls.NewLRUClientSessionCache(32)
 
 const virtualDNSIPStr = "10.255.255.53"
 
@@ -66,7 +66,7 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 			MaxConnsPerHost:       1,
 			MaxIdleConns:          1,
 			MaxIdleConnsPerHost:   1,
-			IdleConnTimeout:       90 * time.Second,
+			IdleConnTimeout:       120 * time.Second,
 			TLSHandshakeTimeout:   7 * time.Second,
 			ResponseHeaderTimeout: 8 * time.Second,
 			TLSClientConfig: &tls.Config{
@@ -95,7 +95,7 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 		// Explicitly configure HTTP/2 with idle connection pinging
 		h2transport, err := http2.ConfigureTransports(transport)
 		if err == nil {
-			h2transport.ReadIdleTimeout = 90 * time.Second
+			h2transport.ReadIdleTimeout = 120 * time.Second
 		}
 
 		return &http.Client{
@@ -519,10 +519,10 @@ func ipChecksum(header []byte) uint16 {
 	return ^uint16(sum)
 }
 
-// extractMinTTL parses a DNS response to find the minimum TTL, clamped to [60s, 300s].
+// extractMinTTL parses a DNS response to find the minimum TTL, clamped to [60s, 600s].
 func extractMinTTL(resp []byte) time.Duration {
 	const minTTL = 60 * time.Second
-	const maxTTL = 300 * time.Second
+	const maxTTL = 600 * time.Second
 
 	if len(resp) < 12 {
 		return minTTL
@@ -649,7 +649,7 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 	}
 
 	// Bounded worker pool for DNS resolution.
-	const numWorkers = 8
+	const numWorkers = 4
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			for {
@@ -668,7 +668,7 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 
 	// Start cache eviction
 	for _, c := range caches {
-		startCacheEvictor(ctx, c, 5*time.Minute)
+		startCacheEvictor(ctx, c, 10*time.Minute)
 	}
 
 	return d

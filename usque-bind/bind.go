@@ -377,7 +377,7 @@ func cleanEndpoint(ep string) string {
 func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDevice, protector VpnProtector) error {
 	const (
 		mtu             = 1280
-		keepalive       = 60 * time.Second // relaxed for battery; safe vs 120-300s server timeouts
+		keepalive       = 95 * time.Second // relaxed for battery; safe vs 120-300s server timeouts
 		packetSize      = 1242
 		connectPort     = 443
 		minBackoff      = 1 * time.Second
