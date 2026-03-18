@@ -39,9 +39,6 @@ const (
 	defaultLocale = "en_US"
 )
 
-// quicSessionCache enables 0-RTT resumption across QUIC reconnects.
-var quicSessionCache = tls.NewLRUClientSessionCache(4)
-
 // taggedEndpoint pairs a resolved UDP address with a label for logging.
 type taggedEndpoint struct {
 	addr *net.UDPAddr
@@ -446,14 +443,13 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			backoff = nextBackoff(backoff, maxBackoff)
 			continue
 		}
-		tlsCfg.ClientSessionCache = quicSessionCache // enable 0-RTT resumption
 
 		quicCfg := &quic.Config{
 			EnableDatagrams:         true,
 			InitialPacketSize:       packetSize,
 			KeepAlivePeriod:         keepalive,
-			MaxIdleTimeout:          300 * time.Second, // 3+ keepalive rounds before timeout; CF allows up to 300s
-			DisablePathMTUDiscovery: true,              // saves probe traffic; MTU is fixed at 1280
+			MaxIdleTimeout:          2 * keepalive, // must exceed keep-alive to avoid premature close
+			DisablePathMTUDiscovery: true,           // saves probe traffic; MTU is fixed at 1280
 		}
 
 		udpConn, tr, ipConn, rsp, err := connectHappyEyeballs(
@@ -675,8 +671,8 @@ func connectTunnelProtected(
 		return nil, nil, nil, nil, protectErr
 	}
 
-	// QUIC + Connect-IP with 0-RTT resumption when session ticket is cached
-	conn, err := quic.DialEarly(ctx, udpConn, endpoint, tlsConfig, quicConfig)
+	// QUIC + Connect-IP (mirrors api.ConnectTunnel logic)
+	conn, err := quic.Dial(ctx, udpConn, endpoint, tlsConfig, quicConfig)
 	if err != nil {
 		udpConn.Close()
 		return nil, nil, nil, nil, err
@@ -700,11 +696,11 @@ func connectTunnelProtected(
 }
 
 func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor) {
-	buf := pool.Get()
-	defer pool.Put(buf)
 	for {
+		buf := pool.Get()
 		n, err := device.ReadPacket(buf)
 		if err != nil {
+			pool.Put(buf)
 			errChan <- err
 			return
 		}
@@ -717,6 +713,7 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 				if srcIP, srcPort, dstIP, query, ok := isAnyDNSPacket(pkt); ok {
 					queryCopy := make([]byte, len(query))
 					copy(queryCopy, query)
+					pool.Put(buf)
 					dns.forwardUp(dnsRequest{
 						srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
 						query: queryCopy, writeFunc: device.WritePacket,
@@ -726,6 +723,7 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 				if srcIP, srcPort, dstIP, query, ok := isAnyDNSv6Packet(pkt); ok {
 					queryCopy := make([]byte, len(query))
 					copy(queryCopy, query)
+					pool.Put(buf)
 					dns.forwardUp(dnsRequest{
 						srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
 						query: queryCopy, writeFunc: device.WritePacket,
@@ -737,6 +735,7 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 				if srcIP, srcPort, query, ok := isDNSPacket(pkt); ok {
 					queryCopy := make([]byte, len(query))
 					copy(queryCopy, query)
+					pool.Put(buf)
 					dns.forwardUp(dnsRequest{
 						srcIP: srcIP, srcPort: srcPort, dstIP: virtualDNSIPv4,
 						query: queryCopy, writeFunc: device.WritePacket,
@@ -747,6 +746,7 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 		}
 
 		icmp, err := ipConn.WritePacket(pkt)
+		pool.Put(buf)
 		if err != nil {
 			errChan <- err
 			return
