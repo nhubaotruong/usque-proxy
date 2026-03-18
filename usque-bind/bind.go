@@ -39,6 +39,9 @@ const (
 	defaultLocale = "en_US"
 )
 
+// quicSessionCache enables TLS session resumption across QUIC reconnects (1-RTT, not 0-RTT).
+var quicSessionCache = tls.NewLRUClientSessionCache(4)
+
 // taggedEndpoint pairs a resolved UDP address with a label for logging.
 type taggedEndpoint struct {
 	addr *net.UDPAddr
@@ -444,12 +447,14 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			continue
 		}
 
+		tlsCfg.ClientSessionCache = quicSessionCache // 1-RTT session resumption (not 0-RTT)
+
 		quicCfg := &quic.Config{
 			EnableDatagrams:         true,
 			InitialPacketSize:       packetSize,
 			KeepAlivePeriod:         keepalive,
-			MaxIdleTimeout:          2 * keepalive, // must exceed keep-alive to avoid premature close
-			DisablePathMTUDiscovery: true,           // saves probe traffic; MTU is fixed at 1280
+			MaxIdleTimeout:          300 * time.Second, // 3+ keepalive rounds before timeout; CF allows up to 300s
+			DisablePathMTUDiscovery: true,              // saves probe traffic; MTU is fixed at 1280
 		}
 
 		udpConn, tr, ipConn, rsp, err := connectHappyEyeballs(
