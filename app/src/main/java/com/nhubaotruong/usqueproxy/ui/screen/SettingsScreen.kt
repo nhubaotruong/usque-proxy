@@ -206,7 +206,6 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                 DnsMode.SYSTEM to "System",
                 DnsMode.CLOUDFLARE to "Cloudflare",
                 DnsMode.CUSTOM_DOH to "Custom DoH",
-                DnsMode.WARP to "WARP",
             )
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                 dnsModes.forEachIndexed { index, mode ->
@@ -241,17 +240,6 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 4.dp, top = 4.dp),
                 )
-            } else if (prefs.dnsMode == DnsMode.WARP) {
-                Text(
-                    "DNS queries flow through the WARP tunnel to Cloudflare Gateway",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(start = 4.dp, top = 4.dp),
-                )
-            } else {
-                SwitchRow("Prevent DNS leaks", prefs.preventDnsLeak) {
-                    viewModel.setPreventDnsLeak(it)
-                }
             }
             HorizontalDivider()
         }

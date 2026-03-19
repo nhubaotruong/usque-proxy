@@ -66,8 +66,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun clearTunnelError() { _tunnelError.value = null }
 
     companion object {
-        const val STATE_POLL_INTERVAL = 2_000L
-        const val STATS_POLL_INTERVAL = 2_000L
+        const val STATE_POLL_INTERVAL = 5_000L
+        const val STATS_POLL_INTERVAL = 5_000L
     }
 
     /** Called from composable LaunchedEffect — checks volatile booleans, no JNI. */
@@ -266,11 +266,6 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun setDohUrl(url: String) {
         markRestartNeeded()
         viewModelScope.launch { prefs.setDohUrl(url) }
-    }
-
-    fun setPreventDnsLeak(prevent: Boolean) {
-        markRestartNeeded()
-        viewModelScope.launch { prefs.setPreventDnsLeak(prevent) }
     }
 
     fun setCustomSni(sni: String) {

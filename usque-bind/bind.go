@@ -61,11 +61,9 @@ type connResult struct {
 // tunnelConfig extends config.Config with optional tunnel parameters.
 type tunnelConfig struct {
 	config.Config
-	SNI            string   `json:"sni"`
-	ConnectURI     string   `json:"connect_uri"`
-	DoHURL         string   `json:"doh_url"`
-	PreventDnsLeak bool     `json:"prevent_dns_leak"`
-	DnsServers     []string `json:"dns_servers"`
+	SNI        string `json:"sni"`
+	ConnectURI string `json:"connect_uri"`
+	DoHURL     string `json:"doh_url"`
 }
 
 func (t *tunnelConfig) sni() string {
@@ -380,7 +378,7 @@ func cleanEndpoint(ep string) string {
 func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDevice, protector VpnProtector) error {
 	const (
 		mtu             = 1280
-		keepalive       = 95 * time.Second // relaxed for battery; safe vs 120-300s server timeouts
+		keepalive       = 110 * time.Second // relaxed for battery; safe vs 300s MaxIdleTimeout
 		packetSize      = 1242
 		connectPort     = 443
 		minBackoff      = 1 * time.Second
@@ -399,14 +397,13 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 	pool := api.NewNetBuffer(mtu)
 
-	// Create DNS interceptor
-	dns := newDnsInterceptor(ctx, cfg, protector)
-	if dns != nil {
-		defer dns.close()
-		if dns.interceptAll {
-			log.Println("DNS interception enabled: all port 53 traffic")
-		} else {
-			log.Println("DNS interception enabled: virtual DNS IP only")
+	// Create DNS interceptor (only when DoH URL is configured)
+	var dns *dnsInterceptor
+	if cfg.DoHURL != "" {
+		dns = newDnsInterceptor(ctx, cfg, protector)
+		if dns != nil {
+			defer dns.close()
+			log.Println("DNS interception enabled: all port 53 traffic via DoH")
 		}
 	}
 
@@ -712,41 +709,28 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 		pkt := buf[:n]
 		txBytes.Add(int64(n))
 
-		// Intercept DNS packets (IPv4 and IPv6)
+		// Intercept DNS packets (IPv4 and IPv6) when DoH is active
 		if dns != nil {
-			if dns.interceptAll {
-				if srcIP, srcPort, dstIP, query, ok := isAnyDNSPacket(pkt); ok {
-					queryCopy := make([]byte, len(query))
-					copy(queryCopy, query)
-					pool.Put(buf)
-					dns.forwardUp(dnsRequest{
-						srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
-						query: queryCopy, writeFunc: device.WritePacket,
-					})
-					continue
-				}
-				if srcIP, srcPort, dstIP, query, ok := isAnyDNSv6Packet(pkt); ok {
-					queryCopy := make([]byte, len(query))
-					copy(queryCopy, query)
-					pool.Put(buf)
-					dns.forwardUp(dnsRequest{
-						srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
-						query: queryCopy, writeFunc: device.WritePacket,
-						isIPv6: true,
-					})
-					continue
-				}
-			} else {
-				if srcIP, srcPort, query, ok := isDNSPacket(pkt); ok {
-					queryCopy := make([]byte, len(query))
-					copy(queryCopy, query)
-					pool.Put(buf)
-					dns.forwardUp(dnsRequest{
-						srcIP: srcIP, srcPort: srcPort, dstIP: virtualDNSIPv4,
-						query: queryCopy, writeFunc: device.WritePacket,
-					})
-					continue
-				}
+			if srcIP, srcPort, dstIP, query, ok := isAnyDNSPacket(pkt); ok {
+				queryCopy := make([]byte, len(query))
+				copy(queryCopy, query)
+				pool.Put(buf)
+				dns.forwardUp(dnsRequest{
+					srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
+					query: queryCopy, writeFunc: device.WritePacket,
+				})
+				continue
+			}
+			if srcIP, srcPort, dstIP, query, ok := isAnyDNSv6Packet(pkt); ok {
+				queryCopy := make([]byte, len(query))
+				copy(queryCopy, query)
+				pool.Put(buf)
+				dns.forwardUp(dnsRequest{
+					srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
+					query: queryCopy, writeFunc: device.WritePacket,
+					isIPv6: true,
+				})
+				continue
 			}
 		}
 

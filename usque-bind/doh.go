@@ -21,10 +21,6 @@ import (
 // globalTLSSessionCache is shared across all DoH clients to survive client resets.
 var globalTLSSessionCache = tls.NewLRUClientSessionCache(32)
 
-const virtualDNSIPStr = "10.255.255.53"
-
-var virtualDNSIPv4 = net.IPv4(10, 255, 255, 53).To4()
-
 // dnsResponsePool reuses buffers for building DNS response packets.
 // Max size: 40 (IPv6) + 8 (UDP) + 4096 (DNS payload) = 4144.
 var dnsResponsePool = sync.Pool{
@@ -468,45 +464,6 @@ func (d *dohProxy) resetClient() {
 	d.client = d.makeClient()
 }
 
-// isDNSPacket checks if pkt is an IPv4 UDP packet destined for the virtual DNS IP on port 53.
-// Returns srcIP, srcPort, DNS payload, and true if it's a DNS packet; false otherwise.
-func isDNSPacket(pkt []byte) (srcIP net.IP, srcPort uint16, payload []byte, ok bool) {
-	// Minimum: 20 (IPv4) + 8 (UDP) + 12 (DNS header)
-	if len(pkt) < 40 {
-		return nil, 0, nil, false
-	}
-	// Check IPv4
-	version := pkt[0] >> 4
-	if version != 4 {
-		return nil, 0, nil, false
-	}
-	// Check protocol = UDP (17)
-	if pkt[9] != 17 {
-		return nil, 0, nil, false
-	}
-	// Check destination IP = virtualDNSIP (10.255.255.53)
-	if pkt[16] != 10 || pkt[17] != 255 || pkt[18] != 255 || pkt[19] != 53 {
-		return nil, 0, nil, false
-	}
-
-	ihl := int(pkt[0]&0x0f) * 4
-	if len(pkt) < ihl+8 {
-		return nil, 0, nil, false
-	}
-
-	// Check destination port = 53
-	dstPort := binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
-	if dstPort != 53 {
-		return nil, 0, nil, false
-	}
-
-	srcIP = net.IP(pkt[12:16]).To4()
-	srcPort = binary.BigEndian.Uint16(pkt[ihl : ihl+2])
-	payload = pkt[ihl+8:]
-	ok = true
-	return
-}
-
 // ipChecksum computes the IPv4 header checksum.
 func ipChecksum(header []byte) uint16 {
 	var sum uint32
@@ -601,55 +558,34 @@ type dnsRequest struct {
 	isIPv6    bool
 }
 
-// dnsInterceptor is a unified DNS interception wrapper that works across all DNS modes.
+// dnsInterceptor intercepts all port 53 traffic and resolves via DoH.
 type dnsInterceptor struct {
-	resolver     func(query []byte) ([]byte, error)
-	interceptAll bool // true = intercept all port 53 traffic, false = only virtualDNSIP
-	reqCh        chan dnsRequest
-	closeFunc    func() // called on shutdown to close pooled connections
-	resetFunc    func() // called on network change to discard stale connections
+	resolver  func(query []byte) ([]byte, error)
+	reqCh     chan dnsRequest
+	resetFunc func() // called on network change to discard stale connections
 }
 
-// newDnsInterceptor creates a dnsInterceptor based on the tunnel config.
+// newDnsInterceptor creates a dnsInterceptor that resolves all DNS via DoH.
+// Returns nil if no DoH URL is configured.
 func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProtector) *dnsInterceptor {
-	var resolver func(query []byte) ([]byte, error)
-	var interceptAll bool
-	var closeFunc func()
-	var caches []*sync.Map
-
-	var resetFunc func()
-
-	if cfg.DoHURL != "" {
-		doh := newDohProxy(cfg.DoHURL, protector)
-		doh.warmConnection()
-		resolver = doh.resolve
-		interceptAll = cfg.PreventDnsLeak
-		caches = append(caches, &doh.cache)
-		resetFunc = func() {
-			doh.resetClient()
-			doh.warmConnection()
-		}
-	} else if cfg.PreventDnsLeak && len(cfg.DnsServers) > 0 {
-		plain := newPlainDnsProxy(cfg.DnsServers, protector)
-		resolver = plain.resolve
-		interceptAll = true
-		closeFunc = plain.close
-		resetFunc = plain.resetConnections
-		caches = append(caches, &plain.cache)
-	} else {
+	if cfg.DoHURL == "" {
 		return nil
 	}
 
+	doh := newDohProxy(cfg.DoHURL, protector)
+	doh.warmConnection()
+
 	d := &dnsInterceptor{
-		resolver:     resolver,
-		interceptAll: interceptAll,
-		reqCh:        make(chan dnsRequest, 256),
-		closeFunc:    closeFunc,
-		resetFunc:    resetFunc,
+		resolver: doh.resolve,
+		reqCh:    make(chan dnsRequest, 256),
+		resetFunc: func() {
+			doh.resetClient()
+			doh.warmConnection()
+		},
 	}
 
 	// Bounded worker pool for DNS resolution.
-	const numWorkers = 4
+	const numWorkers = 2
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			for {
@@ -666,10 +602,7 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 		}()
 	}
 
-	// Start cache eviction
-	for _, c := range caches {
-		startCacheEvictor(ctx, c, 10*time.Minute)
-	}
+	startCacheEvictor(ctx, &doh.cache, 30*time.Minute)
 
 	return d
 }
@@ -683,12 +616,8 @@ func (d *dnsInterceptor) forwardUp(req dnsRequest) {
 	}
 }
 
-// close shuts down the interceptor, closing any pooled connections.
-func (d *dnsInterceptor) close() {
-	if d.closeFunc != nil {
-		d.closeFunc()
-	}
-}
+// close is a no-op (DoH client is GC'd with the interceptor).
+func (d *dnsInterceptor) close() {}
 
 // resetConnections discards stale DNS connections after a network change.
 func (d *dnsInterceptor) resetConnections() {
@@ -827,185 +756,6 @@ func udp6Checksum(srcIP, dstIP, udpSegment []byte) uint16 {
 		csum = 0xffff // RFC 2460: 0 means no checksum, use 0xffff instead
 	}
 	return csum
-}
-
-// serverConn wraps a UDP connection with a mutex to serialize queries per server.
-// This prevents response mismatch when multiple workers query the same server.
-type serverConn struct {
-	mu   sync.Mutex
-	conn *net.UDPConn
-}
-
-// plainDnsProxy forwards DNS queries via protected UDP sockets to upstream servers.
-// Connections are pooled and reused across queries, one per server.
-type plainDnsProxy struct {
-	servers   []string
-	protector VpnProtector
-	cache     sync.Map // query content -> *cacheEntry
-	mu        sync.Mutex
-	conns     map[string]*serverConn
-}
-
-func newPlainDnsProxy(servers []string, protector VpnProtector) *plainDnsProxy {
-	return &plainDnsProxy{
-		servers:   servers,
-		protector: protector,
-		conns:     make(map[string]*serverConn),
-	}
-}
-
-// getServerConn returns (or creates) the serverConn entry for the given server.
-func (p *plainDnsProxy) getServerConn(server string) *serverConn {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	sc, ok := p.conns[server]
-	if !ok {
-		sc = &serverConn{}
-		p.conns[server] = sc
-	}
-	return sc
-}
-
-// dialConn creates a new protected UDP connection to the server.
-func (p *plainDnsProxy) dialConn(server string) (*net.UDPConn, error) {
-	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(server, "53"))
-	if err != nil {
-		return nil, err
-	}
-
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		return nil, err
-	}
-
-	// Protect the socket from VPN routing
-	rawConn, err := conn.SyscallConn()
-	if err != nil {
-		conn.Close()
-		return nil, err
-	}
-	var protectErr error
-	rawConn.Control(func(fd uintptr) {
-		if !p.protector.ProtectFd(int(fd)) {
-			protectErr = errors.New("VPN protect() failed")
-		}
-	})
-	if protectErr != nil {
-		conn.Close()
-		return nil, protectErr
-	}
-
-	return conn, nil
-}
-
-// close closes all pooled connections.
-func (p *plainDnsProxy) close() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for server, sc := range p.conns {
-		sc.mu.Lock()
-		if sc.conn != nil {
-			sc.conn.Close()
-			sc.conn = nil
-		}
-		sc.mu.Unlock()
-		delete(p.conns, server)
-	}
-}
-
-// resetConnections closes all pooled UDP connections so they are lazily
-// recreated on the next query, bound to the new network's socket.
-func (p *plainDnsProxy) resetConnections() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, sc := range p.conns {
-		sc.mu.Lock()
-		if sc.conn != nil {
-			sc.conn.Close()
-			sc.conn = nil
-		}
-		sc.mu.Unlock()
-	}
-}
-
-func (p *plainDnsProxy) resolve(query []byte) ([]byte, error) {
-	if len(query) < 12 {
-		return nil, errors.New("DNS query too short")
-	}
-
-	// Save original transaction ID and zero it for cache key
-	origID := [2]byte{query[0], query[1]}
-	query[0], query[1] = 0, 0
-
-	cacheKey := string(query)
-	if v, ok := p.cache.Load(cacheKey); ok {
-		entry := v.(*cacheEntry)
-		if time.Now().Before(entry.expiry) {
-			resp := make([]byte, len(entry.response))
-			copy(resp, entry.response)
-			resp[0], resp[1] = origID[0], origID[1]
-			query[0], query[1] = origID[0], origID[1]
-			return resp, nil
-		}
-		p.cache.Delete(cacheKey)
-	}
-
-	// Restore original ID for wire query (UDP servers expect it)
-	query[0], query[1] = origID[0], origID[1]
-
-	var lastErr error
-	for _, server := range p.servers {
-		resp, err := p.queryServer(server, query)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		// Cache with zeroed transaction ID
-		cacheCopy := make([]byte, len(resp))
-		copy(cacheCopy, resp)
-		cacheCopy[0], cacheCopy[1] = 0, 0
-		ttl := extractMinTTL(resp)
-		p.cache.Store(cacheKey, &cacheEntry{
-			response: cacheCopy,
-			expiry:   time.Now().Add(ttl),
-		})
-		return resp, nil
-	}
-	return nil, fmt.Errorf("all DNS servers failed: %v", lastErr)
-}
-
-func (p *plainDnsProxy) queryServer(server string, query []byte) ([]byte, error) {
-	sc := p.getServerConn(server)
-
-	// Hold per-server lock for the entire write+read cycle to prevent response mismatch
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-
-	// Lazily create connection
-	if sc.conn == nil {
-		conn, err := p.dialConn(server)
-		if err != nil {
-			return nil, err
-		}
-		sc.conn = conn
-	}
-
-	sc.conn.SetDeadline(time.Now().Add(5 * time.Second))
-
-	if _, err := sc.conn.Write(query); err != nil {
-		sc.conn.Close()
-		sc.conn = nil
-		return nil, err
-	}
-
-	buf := make([]byte, 4096)
-	n, err := sc.conn.Read(buf)
-	if err != nil {
-		sc.conn.Close()
-		sc.conn = nil
-		return nil, err
-	}
-	return buf[:n], nil
 }
 
 // isAnyDNSPacket checks if pkt is an IPv4 UDP packet destined for ANY IP on port 53.

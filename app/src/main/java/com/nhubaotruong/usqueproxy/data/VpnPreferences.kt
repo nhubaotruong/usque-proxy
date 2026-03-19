@@ -11,7 +11,7 @@ import kotlinx.coroutines.flow.map
 
 enum class SplitMode { ALL, INCLUDE, EXCLUDE }
 enum class ThemeMode { SYSTEM, LIGHT, DARK }
-enum class DnsMode { SYSTEM, CLOUDFLARE, CUSTOM_DOH, WARP }
+enum class DnsMode { SYSTEM, CLOUDFLARE, CUSTOM_DOH }
 enum class ProfileType { WARP, ZERO_TRUST }
 
 data class VpnPrefs(
@@ -23,7 +23,6 @@ data class VpnPrefs(
     val isMetered: Boolean = false,
     val dnsMode: DnsMode = DnsMode.SYSTEM,
     val dohUrl: String = "",
-    val preventDnsLeak: Boolean = false,
     val activeProfile: ProfileType = ProfileType.WARP,
     val warpConfigJson: String = "",
     val isWarpRegistered: Boolean = false,
@@ -62,7 +61,6 @@ class VpnPreferences(private val context: Context) {
         val USE_SYSTEM_DNS = booleanPreferencesKey("use_system_dns") // legacy, for migration
         val DNS_MODE = stringPreferencesKey("dns_mode")
         val DOH_URL = stringPreferencesKey("doh_url")
-        val PREVENT_DNS_LEAK = booleanPreferencesKey("prevent_dns_leak")
         // Legacy keys (migrated to per-profile)
         val CONFIG_JSON = stringPreferencesKey("config_json")
         val IS_REGISTERED = booleanPreferencesKey("is_registered")
@@ -95,14 +93,13 @@ class VpnPreferences(private val context: Context) {
             bypassOffice365 = p[Keys.BYPASS_OFFICE365] ?: false,
             isMetered = p[Keys.IS_METERED] ?: false,
             dnsMode = p[Keys.DNS_MODE]?.let {
-                runCatching { DnsMode.valueOf(it) }.getOrDefault(DnsMode.SYSTEM)
+                runCatching { DnsMode.valueOf(it) }.getOrDefault(DnsMode.CLOUDFLARE)
             } ?: run {
                 // Migration: map old USE_SYSTEM_DNS to DnsMode
                 val useSystem = p[Keys.USE_SYSTEM_DNS] ?: true
                 if (useSystem) DnsMode.SYSTEM else DnsMode.CLOUDFLARE
             },
             dohUrl = p[Keys.DOH_URL] ?: "",
-            preventDnsLeak = p[Keys.PREVENT_DNS_LEAK] ?: false,
             activeProfile = runCatching {
                 ProfileType.valueOf(p[Keys.ACTIVE_PROFILE] ?: "WARP")
             }.getOrDefault(ProfileType.WARP),
@@ -148,10 +145,6 @@ class VpnPreferences(private val context: Context) {
 
     suspend fun setDohUrl(url: String) {
         context.dataStore.edit { it[Keys.DOH_URL] = url }
-    }
-
-    suspend fun setPreventDnsLeak(prevent: Boolean) {
-        context.dataStore.edit { it[Keys.PREVENT_DNS_LEAK] = prevent }
     }
 
     suspend fun saveWarpConfig(json: String) {

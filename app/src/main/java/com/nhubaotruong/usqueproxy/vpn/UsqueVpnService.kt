@@ -106,7 +106,12 @@ class UsqueVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        when (intent?.action) {
+        if (intent == null) {
+            // OS restarted service after force-close — do not restart tunnel
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        when (intent.action) {
             ACTION_STOP -> {
                 lifecycleExecutor.execute { stopVpnInternal() }
                 return START_NOT_STICKY
@@ -117,13 +122,13 @@ class UsqueVpnService : VpnService() {
                     stopVpnInternal()
                     launchStartJob()
                 }
-                return START_STICKY
+                return START_NOT_STICKY
             }
         }
 
         startForeground(NOTIFICATION_ID, buildNotification())
         launchStartJob()
-        return START_STICKY
+        return START_NOT_STICKY
     }
 
     private fun launchStartJob() {
@@ -189,23 +194,11 @@ class UsqueVpnService : VpnService() {
             DnsMode.CLOUDFLARE -> {
                 builder.addDnsServer("1.1.1.1")
                 builder.addDnsServer("2606:4700:4700::1111")
-                if (prefs.preventDnsLeak) {
-                    config.put("prevent_dns_leak", true)
-                    config.put("doh_url", "https://cloudflare-dns.com/dns-query")
-                }
             }
             DnsMode.CUSTOM_DOH -> {
-                builder.addDnsServer("10.255.255.53")
-                builder.addRoute("10.255.255.53", 32)
-                config.put("doh_url", prefs.dohUrl)
-                if (prefs.preventDnsLeak) {
-                    config.put("prevent_dns_leak", true)
-                }
-            }
-            DnsMode.WARP -> {
                 builder.addDnsServer("1.1.1.1")
                 builder.addDnsServer("2606:4700:4700::1111")
-                // No doh_url/prevent_dns_leak/dns_servers — DNS flows through tunnel
+                config.put("doh_url", prefs.dohUrl)
             }
         }
 
