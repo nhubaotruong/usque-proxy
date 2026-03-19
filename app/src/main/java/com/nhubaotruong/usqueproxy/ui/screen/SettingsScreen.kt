@@ -202,7 +202,12 @@ fun SettingsScreen(viewModel: VpnViewModel) {
             Text("DNS", style = MaterialTheme.typography.bodyLarge,
                 modifier = Modifier.padding(vertical = 8.dp))
             val dnsModes = DnsMode.entries
-            val dnsLabels = listOf("System", "Cloudflare", "Custom DoH")
+            val dnsLabelMap = mapOf(
+                DnsMode.SYSTEM to "System",
+                DnsMode.CLOUDFLARE to "Cloudflare",
+                DnsMode.CUSTOM_DOH to "Custom DoH",
+                DnsMode.WARP to "WARP",
+            )
             SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
                 dnsModes.forEachIndexed { index, mode ->
                     SegmentedButton(
@@ -210,7 +215,7 @@ fun SettingsScreen(viewModel: VpnViewModel) {
                         onClick = { viewModel.setDnsMode(mode) },
                         shape = SegmentedButtonDefaults.itemShape(index, dnsModes.size),
                     ) {
-                        Text(dnsLabels[index], style = MaterialTheme.typography.labelSmall)
+                        Text(dnsLabelMap[mode]!!, style = MaterialTheme.typography.labelSmall)
                     }
                 }
             }
@@ -232,6 +237,13 @@ fun SettingsScreen(viewModel: VpnViewModel) {
             if (prefs.dnsMode == DnsMode.SYSTEM) {
                 Text(
                     "DNS and DNS-over-TLS traffic will bypass the tunnel",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 4.dp, top = 4.dp),
+                )
+            } else if (prefs.dnsMode == DnsMode.WARP) {
+                Text(
+                    "DNS queries flow through the WARP tunnel to Cloudflare Gateway",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     modifier = Modifier.padding(start = 4.dp, top = 4.dp),

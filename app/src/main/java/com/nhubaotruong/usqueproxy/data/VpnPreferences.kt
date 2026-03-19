@@ -11,7 +11,7 @@ import kotlinx.coroutines.flow.map
 
 enum class SplitMode { ALL, INCLUDE, EXCLUDE }
 enum class ThemeMode { SYSTEM, LIGHT, DARK }
-enum class DnsMode { SYSTEM, CLOUDFLARE, CUSTOM_DOH }
+enum class DnsMode { SYSTEM, CLOUDFLARE, CUSTOM_DOH, WARP }
 enum class ProfileType { WARP, ZERO_TRUST }
 
 data class VpnPrefs(

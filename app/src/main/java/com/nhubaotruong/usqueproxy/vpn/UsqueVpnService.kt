@@ -11,6 +11,8 @@ import android.net.IpPrefix
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.VpnService
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import com.nhubaotruong.usqueproxy.MainActivity
@@ -30,12 +32,15 @@ import org.json.JSONArray
 import org.json.JSONObject
 import usquebind.Usquebind
 import usquebind.VpnProtector
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 
 class UsqueVpnService : VpnService() {
 
     companion object {
         const val TAG = "UsqueVpnService"
         const val ACTION_STOP = "com.nhubaotruong.usqueproxy.STOP_VPN"
+        const val ACTION_RESTART = "com.nhubaotruong.usqueproxy.RESTART_VPN"
         const val CHANNEL_ID = "vpn_channel"
         const val NOTIFICATION_ID = 1
 
@@ -84,6 +89,16 @@ class UsqueVpnService : VpnService() {
     private var currentNetwork: Network? = null
     @Volatile
     private var underlyingNetworkSet = false
+    @Volatile
+    private var isStopping = false
+
+    private val lifecycleExecutor: ExecutorService = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "usque-lifecycle")
+    }
+    private val reconnectHandler = Handler(Looper.getMainLooper())
+    private val reconnectRunnable = Runnable {
+        if (isRunning && !isStopping) Usquebind.reconnect()
+    }
 
     override fun onCreate() {
         super.onCreate()
@@ -91,13 +106,27 @@ class UsqueVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP) {
-            stopVpn()
-            return START_NOT_STICKY
+        when (intent?.action) {
+            ACTION_STOP -> {
+                lifecycleExecutor.execute { stopVpnInternal() }
+                return START_NOT_STICKY
+            }
+            ACTION_RESTART -> {
+                startForeground(NOTIFICATION_ID, buildNotification())
+                lifecycleExecutor.execute {
+                    stopVpnInternal()
+                    launchStartJob()
+                }
+                return START_STICKY
+            }
         }
 
         startForeground(NOTIFICATION_ID, buildNotification())
+        launchStartJob()
+        return START_STICKY
+    }
 
+    private fun launchStartJob() {
         startJob = CoroutineScope(Dispatchers.IO).launch {
             val prefs = VpnPreferences(this@UsqueVpnService).prefsFlow.first()
 
@@ -114,7 +143,6 @@ class UsqueVpnService : VpnService() {
 
             startVpn(prefs)
         }
-        return START_STICKY
     }
 
     private fun startVpn(prefs: VpnPrefs) {
@@ -173,6 +201,11 @@ class UsqueVpnService : VpnService() {
                 if (prefs.preventDnsLeak) {
                     config.put("prevent_dns_leak", true)
                 }
+            }
+            DnsMode.WARP -> {
+                builder.addDnsServer("1.1.1.1")
+                builder.addDnsServer("2606:4700:4700::1111")
+                // No doh_url/prevent_dns_leak/dns_servers — DNS flows through tunnel
             }
         }
 
@@ -258,12 +291,13 @@ class UsqueVpnService : VpnService() {
                 Log.e(TAG, "Tunnel error", e)
                 lastError = e.message ?: "Tunnel failed"
             } finally {
-                // Mark not running and request service stop on main thread.
-                // Don't call stopVpn() here — it joins this thread and does
-                // heavy cleanup; let onDestroy handle it instead.
                 isRunning = false
                 VpnTileService.requestUpdate(this@UsqueVpnService)
-                android.os.Handler(android.os.Looper.getMainLooper()).post { stopSelf() }
+                // Only self-stop if not in a managed restart/stop — during those,
+                // stopVpnInternal() handles the lifecycle.
+                if (!isStopping) {
+                    Handler(Looper.getMainLooper()).post { stopSelf() }
+                }
             }
         }, "usque-tunnel").also { it.start() }
 
@@ -334,33 +368,56 @@ class UsqueVpnService : VpnService() {
     }
 
     private fun restartTunnel() {
-        // Signal Go to tear down the current QUIC connection and reconnect.
-        // Unlike stopTunnel(), this keeps the reconnect loop alive.
-        Usquebind.reconnect()
+        // Debounce rapid network changes (WiFi↔cellular) into a single reconnect
+        reconnectHandler.removeCallbacks(reconnectRunnable)
+        reconnectHandler.postDelayed(reconnectRunnable, 300)
     }
 
-    private fun stopVpn() {
-        startJob?.cancel()
-        startJob = null
-        unregisterNetworkCallback()
-        Usquebind.stopTunnel()       // Cancel Go context
-        tunnelThread?.join(5000)     // Wait for Go to finish using the fd
-        tunnelThread = null
-        vpnInterface?.close()        // Safe — Go is done
-        vpnInterface = null
-        isRunning = false
-        VpnTileService.requestUpdate(this)
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
+    /**
+     * Performs full VPN shutdown. Must be called on [lifecycleExecutor] thread,
+     * never on the main thread (contains Thread.join).
+     */
+    private fun stopVpnInternal() {
+        if (isStopping) return
+        isStopping = true
+        try {
+            startJob?.cancel()
+            startJob = null
+            reconnectHandler.removeCallbacks(reconnectRunnable)
+            unregisterNetworkCallback()
+            Usquebind.stopTunnel()
+            tunnelThread?.let { t ->
+                t.join(5000)
+                if (t.isAlive) {
+                    Log.w(TAG, "Tunnel thread did not exit within timeout, interrupting")
+                    t.interrupt()
+                    t.join(2000)
+                }
+            }
+            tunnelThread = null
+            vpnInterface?.close()
+            vpnInterface = null
+            isRunning = false
+            VpnTileService.requestUpdate(this)
+            // stopForeground/stopSelf must run on main thread
+            Handler(Looper.getMainLooper()).post {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+            }
+        } finally {
+            isStopping = false
+        }
     }
 
     override fun onDestroy() {
-        stopVpn()
+        reconnectHandler.removeCallbacks(reconnectRunnable)
+        stopVpnInternal()
+        lifecycleExecutor.shutdown()
         super.onDestroy()
     }
 
     override fun onRevoke() {
-        stopVpn()
+        stopVpnInternal()
         super.onRevoke()
     }
 

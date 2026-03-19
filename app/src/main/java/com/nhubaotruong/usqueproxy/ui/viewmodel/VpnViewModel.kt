@@ -15,7 +15,6 @@ import com.nhubaotruong.usqueproxy.data.VpnPreferences
 import com.nhubaotruong.usqueproxy.data.VpnPrefs
 import com.nhubaotruong.usqueproxy.vpn.UsqueVpnService
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -120,13 +119,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun restartVpn() {
-        disconnect()
+        _vpnState.value = VpnState.CONNECTING
         _needsRestart.value = false
-        // Small delay to let the service stop before reconnecting
-        viewModelScope.launch {
-            delay(500)
-            connect()
+        UsqueVpnService.clearError()
+        val ctx = getApplication<Application>()
+        val intent = Intent(ctx, UsqueVpnService::class.java).apply {
+            action = UsqueVpnService.ACTION_RESTART
         }
+        ContextCompat.startForegroundService(ctx, intent)
     }
 
     private fun markRestartNeeded() {
