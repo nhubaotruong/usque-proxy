@@ -680,6 +680,221 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 	return d
 }
 
+// systemDnsResolver forwards DNS queries via protected UDP sockets to system DNS servers.
+type systemDnsResolver struct {
+	servers   []string
+	protector VpnProtector
+	cache     *lruCache
+	refreshing sync.Map
+}
+
+func newSystemDnsResolver(servers []string, protector VpnProtector) *systemDnsResolver {
+	return &systemDnsResolver{
+		servers:   servers,
+		protector: protector,
+		cache:     newLRUCache(1024),
+	}
+}
+
+// resolve sends a DNS query to system DNS servers via protected UDP sockets.
+func (s *systemDnsResolver) resolve(query []byte) ([]byte, error) {
+	if len(query) < 12 {
+		return nil, errors.New("DNS query too short")
+	}
+
+	// Save original transaction ID and zero it for cache key
+	origID := [2]byte{query[0], query[1]}
+	query[0], query[1] = 0, 0
+
+	cacheKey := string(query)
+	if entry, ok := s.cache.get(cacheKey); ok {
+		now := time.Now()
+		if now.Before(entry.expiry) {
+			resp := make([]byte, len(entry.response))
+			copy(resp, entry.response)
+			resp[0], resp[1] = origID[0], origID[1]
+			query[0], query[1] = origID[0], origID[1]
+			// Proactive refresh at 75% TTL
+			if entry.originalTTL > 0 {
+				refreshAt := entry.expiry.Add(-entry.originalTTL / 4)
+				if now.After(refreshAt) {
+					if _, loaded := s.refreshing.LoadOrStore(cacheKey, struct{}{}); !loaded {
+						queryCopy := make([]byte, len(query))
+						copy(queryCopy, query)
+						queryCopy[0], queryCopy[1] = 0, 0
+						go s.backgroundRefresh(cacheKey, queryCopy)
+					}
+				}
+			}
+			return resp, nil
+		}
+		if now.Before(entry.staleDeadline) {
+			resp := make([]byte, len(entry.response))
+			copy(resp, entry.response)
+			resp[0], resp[1] = origID[0], origID[1]
+			query[0], query[1] = origID[0], origID[1]
+			if _, loaded := s.refreshing.LoadOrStore(cacheKey, struct{}{}); !loaded {
+				queryCopy := make([]byte, len(query))
+				copy(queryCopy, query)
+				queryCopy[0], queryCopy[1] = 0, 0
+				go s.backgroundRefresh(cacheKey, queryCopy)
+			}
+			return resp, nil
+		}
+		s.cache.delete(cacheKey)
+	}
+
+	body, err := s.queryServers(query)
+	if err != nil {
+		query[0], query[1] = origID[0], origID[1]
+		return nil, err
+	}
+
+	// Cache with zeroed transaction ID
+	cacheCopy := make([]byte, len(body))
+	copy(cacheCopy, body)
+	cacheCopy[0], cacheCopy[1] = 0, 0
+	ttl := extractMinTTL(body)
+	now := time.Now()
+	s.cache.put(cacheKey, &cacheEntry{
+		response:      cacheCopy,
+		expiry:        now.Add(ttl),
+		staleDeadline: now.Add(ttl + staleGracePeriod),
+		originalTTL:   ttl,
+	})
+
+	body[0], body[1] = origID[0], origID[1]
+	query[0], query[1] = origID[0], origID[1]
+	return body, nil
+}
+
+// queryServers sends a DNS query to each configured server until one succeeds.
+func (s *systemDnsResolver) queryServers(query []byte) ([]byte, error) {
+	var lastErr error
+	for _, server := range s.servers {
+		resp, err := s.queryServer(server, query)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		return resp, nil
+	}
+	return nil, fmt.Errorf("all system DNS servers failed: %v", lastErr)
+}
+
+// queryServer sends a DNS query to a single server via a protected UDP socket.
+func (s *systemDnsResolver) queryServer(server string, query []byte) ([]byte, error) {
+	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(server, "53"))
+	if err != nil {
+		return nil, fmt.Errorf("resolve %s: %w", server, err)
+	}
+
+	// Determine local address family to match the server
+	localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	if addr.IP.To4() == nil {
+		localAddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
+	}
+
+	conn, err := net.ListenUDP("udp", localAddr)
+	if err != nil {
+		return nil, fmt.Errorf("listen: %w", err)
+	}
+	defer conn.Close()
+
+	// Protect socket from VPN routing
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return nil, fmt.Errorf("syscall conn: %w", err)
+	}
+	var protectErr error
+	rawConn.Control(func(fd uintptr) {
+		if !s.protector.ProtectFd(int(fd)) {
+			protectErr = errors.New("VPN protect() failed for DNS socket")
+		}
+	})
+	if protectErr != nil {
+		return nil, protectErr
+	}
+
+	conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	_, err = conn.WriteToUDP(query, addr)
+	if err != nil {
+		return nil, fmt.Errorf("write to %s: %w", server, err)
+	}
+
+	buf := make([]byte, 4096)
+	n, err := conn.Read(buf)
+	if err != nil {
+		return nil, fmt.Errorf("read from %s: %w", server, err)
+	}
+
+	if n < 12 {
+		return nil, fmt.Errorf("response from %s too short (%d bytes)", server, n)
+	}
+
+	resp := make([]byte, n)
+	copy(resp, buf[:n])
+	return resp, nil
+}
+
+func (s *systemDnsResolver) backgroundRefresh(cacheKey string, query []byte) {
+	defer s.refreshing.Delete(cacheKey)
+
+	body, err := s.queryServers(query)
+	if err != nil {
+		log.Printf("System DNS background refresh error: %v", err)
+		return
+	}
+
+	cacheCopy := make([]byte, len(body))
+	copy(cacheCopy, body)
+	cacheCopy[0], cacheCopy[1] = 0, 0
+	ttl := extractMinTTL(body)
+	now := time.Now()
+	s.cache.put(cacheKey, &cacheEntry{
+		response:      cacheCopy,
+		expiry:        now.Add(ttl),
+		staleDeadline: now.Add(ttl + staleGracePeriod),
+		originalTTL:   ttl,
+	})
+}
+
+// newSystemDnsInterceptor creates a dnsInterceptor that forwards DNS queries
+// to system DNS servers via protected UDP sockets (bypassing the VPN).
+func newSystemDnsInterceptor(ctx context.Context, servers []string, protector VpnProtector) *dnsInterceptor {
+	if len(servers) == 0 {
+		return nil
+	}
+
+	resolver := newSystemDnsResolver(servers, protector)
+
+	d := &dnsInterceptor{
+		resolver:  resolver.resolve,
+		reqCh:     make(chan dnsRequest, 256),
+		resetFunc: nil, // no persistent connections to reset
+	}
+
+	const numWorkers = 4
+	for i := 0; i < numWorkers; i++ {
+		go func() {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case req, ok := <-d.reqCh:
+					if !ok {
+						return
+					}
+					d.handleInterceptedDNS(req)
+				}
+			}
+		}()
+	}
+
+	return d
+}
+
 // forwardUp queues a DNS request for processing. Drops the request if the queue is full.
 func (d *dnsInterceptor) forwardUp(req dnsRequest) {
 	select {

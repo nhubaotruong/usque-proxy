@@ -190,11 +190,12 @@ class UsqueVpnService : VpnService() {
         when (prefs.dnsMode) {
             DnsMode.SYSTEM -> {
                 val dns = getSystemDnsServers()
-                Log.d(TAG, "Using system DNS (bypass tunnel): $dns")
+                Log.d(TAG, "Using system DNS (protected forwarding): $dns")
+                // Pass system DNS servers to Go for protected socket forwarding
+                config.put("system_dns", JSONArray(dns))
                 dns.forEach { addr ->
                     builder.addDnsServer(addr)
-                    // Exclude DNS server IPs from VPN routes so DNS (port 53)
-                    // and DNS-over-TLS (port 853) traffic bypasses the tunnel.
+                    // Keep excludeRoute as optimization (reduces TUN traffic when it works)
                     runCatching {
                         val inet = java.net.InetAddress.getByName(addr)
                         val prefix = if (inet is java.net.Inet6Address) 128 else 32

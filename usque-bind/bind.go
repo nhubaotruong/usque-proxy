@@ -63,10 +63,11 @@ type connResult struct {
 // tunnelConfig extends config.Config with optional tunnel parameters.
 type tunnelConfig struct {
 	config.Config
-	SNI         string `json:"sni"`
-	ConnectURI  string `json:"connect_uri"`
-	DoHURL      string `json:"doh_url"`
-	NetworkType string `json:"network_type"`
+	SNI         string   `json:"sni"`
+	ConnectURI  string   `json:"connect_uri"`
+	DoHURL      string   `json:"doh_url"`
+	NetworkType string   `json:"network_type"`
+	SystemDNS   []string `json:"system_dns"`
 }
 
 func (t *tunnelConfig) sni() string {
@@ -417,7 +418,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 	pool := api.NewNetBuffer(mtu)
 
-	// Create DNS interceptor (DoH) or tunnel DNS cache (non-DoH)
+	// Create DNS interceptor (DoH or System DNS) or tunnel DNS cache (fallback)
 	var dns *dnsInterceptor
 	var dnsCache *tunnelDnsCache
 	if cfg.DoHURL != "" {
@@ -425,6 +426,12 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		if dns != nil {
 			defer dns.close()
 			log.Println("DNS interception enabled: all port 53 traffic via DoH")
+		}
+	} else if len(cfg.SystemDNS) > 0 {
+		dns = newSystemDnsInterceptor(ctx, cfg.SystemDNS, protector)
+		if dns != nil {
+			defer dns.close()
+			log.Printf("System DNS interception enabled: forwarding via protected sockets to %v", cfg.SystemDNS)
 		}
 	} else {
 		dnsCache = newTunnelDnsCache(512)
