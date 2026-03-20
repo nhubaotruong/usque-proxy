@@ -2,6 +2,7 @@ package usquebind
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
@@ -33,7 +34,7 @@ type dohProxy struct {
 	client     *http.Client
 	clientMu   sync.Mutex           // protects client recreation
 	protector  VpnProtector
-	cache      sync.Map             // query content -> *cacheEntry
+	cache      *lruCache            // bounded LRU: query content -> *cacheEntry
 	refreshing sync.Map             // cache keys currently being background-refreshed
 	makeClient func() *http.Client  // factory for recreating client on network errors
 	preferGET  bool                 // flip to true on HTTP 405, stay on GET
@@ -43,9 +44,69 @@ type cacheEntry struct {
 	response      []byte
 	expiry        time.Time
 	staleDeadline time.Time
+	originalTTL   time.Duration
 }
 
 const staleGracePeriod = 30 * time.Minute
+
+// lruCache is a bounded, thread-safe LRU cache keyed by string.
+type lruCache struct {
+	mu       sync.Mutex
+	capacity int
+	items    map[string]*list.Element
+	order    *list.List // front = most recently used
+}
+
+type lruItem struct {
+	key   string
+	value *cacheEntry
+}
+
+func newLRUCache(capacity int) *lruCache {
+	return &lruCache{
+		capacity: capacity,
+		items:    make(map[string]*list.Element, capacity),
+		order:    list.New(),
+	}
+}
+
+func (c *lruCache) get(key string) (*cacheEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.items[key]; ok {
+		c.order.MoveToFront(el)
+		return el.Value.(*lruItem).value, true
+	}
+	return nil, false
+}
+
+func (c *lruCache) put(key string, entry *cacheEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.items[key]; ok {
+		c.order.MoveToFront(el)
+		el.Value.(*lruItem).value = entry
+		return
+	}
+	if c.order.Len() >= c.capacity {
+		back := c.order.Back()
+		if back != nil {
+			c.order.Remove(back)
+			delete(c.items, back.Value.(*lruItem).key)
+		}
+	}
+	el := c.order.PushFront(&lruItem{key: key, value: entry})
+	c.items[key] = el
+}
+
+func (c *lruCache) delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if el, ok := c.items[key]; ok {
+		c.order.Remove(el)
+		delete(c.items, key)
+	}
+}
 
 // warmupQuery is a minimal DNS query for "." (root) NS record, used to pre-warm the connection.
 var warmupQuery = []byte{
@@ -59,9 +120,9 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 		transport := &http.Transport{
 			ForceAttemptHTTP2:     true,
 			DisableCompression:    true,
-			MaxConnsPerHost:       1,
-			MaxIdleConns:          1,
-			MaxIdleConnsPerHost:   1,
+			MaxConnsPerHost:       2,
+			MaxIdleConns:          2,
+			MaxIdleConnsPerHost:   2,
 			IdleConnTimeout:       300 * time.Second,
 			TLSHandshakeTimeout:   7 * time.Second,
 			ResponseHeaderTimeout: 8 * time.Second,
@@ -91,7 +152,7 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 		// Explicitly configure HTTP/2 with idle connection pinging
 		h2transport, err := http2.ConfigureTransports(transport)
 		if err == nil {
-			h2transport.ReadIdleTimeout = 300 * time.Second
+			h2transport.ReadIdleTimeout = 30 * time.Second
 		}
 
 		return &http.Client{
@@ -105,6 +166,7 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 		protector:  protector,
 		client:     makeClient(),
 		makeClient: makeClient,
+		cache:      newLRUCache(1024),
 	}
 }
 
@@ -119,8 +181,7 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 	query[0], query[1] = 0, 0
 
 	cacheKey := string(query)
-	if v, ok := d.cache.Load(cacheKey); ok {
-		entry := v.(*cacheEntry)
+	if entry, ok := d.cache.get(cacheKey); ok {
 		now := time.Now()
 		if now.Before(entry.expiry) {
 			// Fresh hit — return immediately
@@ -128,6 +189,18 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 			copy(resp, entry.response)
 			resp[0], resp[1] = origID[0], origID[1]
 			query[0], query[1] = origID[0], origID[1]
+			// Proactive refresh at 75% TTL for popular entries
+			if entry.originalTTL > 0 {
+				refreshAt := entry.expiry.Add(-entry.originalTTL / 4)
+				if now.After(refreshAt) {
+					if _, loaded := d.refreshing.LoadOrStore(cacheKey, struct{}{}); !loaded {
+						queryCopy := make([]byte, len(query))
+						copy(queryCopy, query)
+						queryCopy[0], queryCopy[1] = 0, 0
+						go d.backgroundRefresh(cacheKey, queryCopy)
+					}
+				}
+			}
 			return resp, nil
 		}
 		if now.Before(entry.staleDeadline) {
@@ -136,7 +209,6 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 			copy(resp, entry.response)
 			resp[0], resp[1] = origID[0], origID[1]
 			query[0], query[1] = origID[0], origID[1]
-			// Trigger background refresh (deduped by cache key)
 			if _, loaded := d.refreshing.LoadOrStore(cacheKey, struct{}{}); !loaded {
 				queryCopy := make([]byte, len(query))
 				copy(queryCopy, query)
@@ -146,7 +218,7 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 			return resp, nil
 		}
 		// Fully expired — delete and fall through to network fetch
-		d.cache.Delete(cacheKey)
+		d.cache.delete(cacheKey)
 	}
 
 	body, err := d.fetchFromServer(query)
@@ -161,10 +233,11 @@ func (d *dohProxy) resolve(query []byte) ([]byte, error) {
 	cacheCopy[0], cacheCopy[1] = 0, 0
 	ttl := extractMinTTL(body)
 	now := time.Now()
-	d.cache.Store(cacheKey, &cacheEntry{
+	d.cache.put(cacheKey, &cacheEntry{
 		response:      cacheCopy,
 		expiry:        now.Add(ttl),
 		staleDeadline: now.Add(ttl + staleGracePeriod),
+		originalTTL:   ttl,
 	})
 
 	// Patch caller's original ID into response
@@ -252,10 +325,11 @@ func (d *dohProxy) backgroundRefresh(cacheKey string, query []byte) {
 	cacheCopy[0], cacheCopy[1] = 0, 0
 	ttl := extractMinTTL(body)
 	now := time.Now()
-	d.cache.Store(cacheKey, &cacheEntry{
+	d.cache.put(cacheKey, &cacheEntry{
 		response:      cacheCopy,
 		expiry:        now.Add(ttl),
 		staleDeadline: now.Add(ttl + staleGracePeriod),
+		originalTTL:   ttl,
 	})
 }
 
@@ -479,7 +553,7 @@ func ipChecksum(header []byte) uint16 {
 // extractMinTTL parses a DNS response to find the minimum TTL, clamped to [60s, 600s].
 func extractMinTTL(resp []byte) time.Duration {
 	const minTTL = 60 * time.Second
-	const maxTTL = 600 * time.Second
+	const maxTTL = 1800 * time.Second
 
 	if len(resp) < 12 {
 		return minTTL
@@ -556,6 +630,7 @@ type dnsRequest struct {
 	query     []byte
 	writeFunc func([]byte) error
 	isIPv6    bool
+	poolBuf   *[]byte // if non-nil, return to dnsQueryPool after use
 }
 
 // dnsInterceptor intercepts all port 53 traffic and resolves via DoH.
@@ -585,7 +660,7 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 	}
 
 	// Bounded worker pool for DNS resolution.
-	const numWorkers = 2
+	const numWorkers = 4
 	for i := 0; i < numWorkers; i++ {
 		go func() {
 			for {
@@ -601,8 +676,6 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 			}
 		}()
 	}
-
-	startCacheEvictor(ctx, &doh.cache, 30*time.Minute)
 
 	return d
 }
@@ -628,6 +701,9 @@ func (d *dnsInterceptor) resetConnections() {
 
 // handleInterceptedDNS resolves a DNS query and writes the response packet back.
 func (d *dnsInterceptor) handleInterceptedDNS(req dnsRequest) {
+	if req.poolBuf != nil {
+		defer dnsQueryPool.Put(req.poolBuf)
+	}
 	resp, err := d.resolver(req.query)
 	if err != nil {
 		log.Printf("DNS resolve error: %v", err)
@@ -822,30 +898,3 @@ func isAnyDNSv6Packet(pkt []byte) (srcIP net.IP, srcPort uint16, dstIP net.IP, p
 	return
 }
 
-// startCacheEvictor periodically scans a sync.Map and deletes expired cache entries.
-func startCacheEvictor(ctx context.Context, cache *sync.Map, interval time.Duration) {
-	go func() {
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				now := time.Now()
-				cache.Range(func(key, value any) bool {
-					if entry, ok := value.(*cacheEntry); ok {
-						deadline := entry.staleDeadline
-					if deadline.IsZero() {
-						deadline = entry.expiry
-					}
-					if now.After(deadline) {
-							cache.Delete(key)
-						}
-					}
-					return true
-				})
-			}
-		}
-	}()
-}

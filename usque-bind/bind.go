@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -40,7 +41,7 @@ const (
 )
 
 // quicSessionCache enables TLS session resumption across QUIC reconnects (1-RTT, not 0-RTT).
-var quicSessionCache = tls.NewLRUClientSessionCache(4)
+var quicSessionCache = tls.NewLRUClientSessionCache(8)
 
 // taggedEndpoint pairs a resolved UDP address with a label for logging.
 type taggedEndpoint struct {
@@ -52,6 +53,7 @@ type taggedEndpoint struct {
 type connResult struct {
 	udpConn *net.UDPConn
 	tr      *http3.Transport
+	hconn   *http3.ClientConn
 	ipConn  *connectip.Conn
 	rsp     *http.Response
 	err     error
@@ -61,9 +63,10 @@ type connResult struct {
 // tunnelConfig extends config.Config with optional tunnel parameters.
 type tunnelConfig struct {
 	config.Config
-	SNI        string `json:"sni"`
-	ConnectURI string `json:"connect_uri"`
-	DoHURL     string `json:"doh_url"`
+	SNI         string `json:"sni"`
+	ConnectURI  string `json:"connect_uri"`
+	DoHURL      string `json:"doh_url"`
+	NetworkType string `json:"network_type"`
 }
 
 func (t *tunnelConfig) sni() string {
@@ -99,6 +102,14 @@ func (f *FdAdapter) ReadPacket(buf []byte) (int, error) {
 func (f *FdAdapter) WritePacket(pkt []byte) error {
 	_, err := f.file.Write(pkt)
 	return err
+}
+
+// dnsQueryPool reuses buffers for DNS query copies in forwardUp, reducing GC pressure.
+var dnsQueryPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 0, 512) // typical DNS query size
+		return &buf
+	},
 }
 
 // tunnel state
@@ -176,6 +187,16 @@ func StopTunnel() {
 // networkTriggered is set by Reconnect() to signal that the reconnect was
 // caused by a network change, so maintainTunnel can skip the initial backoff.
 var networkTriggered atomic.Bool
+
+// networkHint stores the current network type ("wifi", "cellular", or "")
+// for adaptive keepalive intervals. Updated from Kotlin via SetNetworkHint.
+var networkHint atomic.Value
+
+// SetNetworkHint updates the network type hint for adaptive keepalive.
+// Call from Kotlin on network change: "wifi", "cellular", or "" (unknown).
+func SetNetworkHint(hint string) {
+	networkHint.Store(hint)
+}
 
 // Reconnect tears down the current QUIC connection but keeps the reconnect
 // loop alive so it re-establishes on the (possibly new) network.
@@ -378,7 +399,6 @@ func cleanEndpoint(ep string) string {
 func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDevice, protector VpnProtector) error {
 	const (
 		mtu             = 1280
-		keepalive       = 110 * time.Second // relaxed for battery; safe vs 300s MaxIdleTimeout
 		packetSize      = 1242
 		connectPort     = 443
 		minBackoff      = 1 * time.Second
@@ -413,6 +433,11 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 	const networkGraceMax = 3 // attempts at minBackoff after network change before escalating
 
+	// Seed network hint from config; Kotlin will update dynamically via SetNetworkHint.
+	if cfg.NetworkType != "" {
+		networkHint.Store(cfg.NetworkType)
+	}
+
 	backoff := minBackoff
 	networkGraceAttempts := 0
 
@@ -446,6 +471,17 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 		tlsCfg.ClientSessionCache = quicSessionCache // 1-RTT session resumption (not 0-RTT)
 
+		// Adaptive keepalive: WiFi=110s, Cellular=25s, Unknown=55s
+		keepalive := 55 * time.Second
+		if v := networkHint.Load(); v != nil {
+			switch v.(string) {
+			case "wifi":
+				keepalive = 110 * time.Second
+			case "cellular":
+				keepalive = 25 * time.Second
+			}
+		}
+
 		quicCfg := &quic.Config{
 			EnableDatagrams:         true,
 			InitialPacketSize:       packetSize,
@@ -454,7 +490,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			DisablePathMTUDiscovery: true,              // saves probe traffic; MTU is fixed at 1280
 		}
 
-		udpConn, tr, ipConn, rsp, err := connectHappyEyeballs(
+		udpConn, tr, hconn, ipConn, rsp, err := connectHappyEyeballs(
 			ctx, tlsCfg, quicCfg,
 			cfg.EndpointV4, cfg.EndpointV6,
 			connectPort, cfg.connectUri(), protector,
@@ -476,10 +512,16 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		// Connection succeeded — reset backoff.
 		backoff = minBackoff
 		log.Println("Connected to MASQUE server")
+
+		// Start L4 proxy (TCP via HTTP/3 CONNECT streams, bypasses TCP-in-QUIC meltdown).
+		l4ctx, l4cancel := context.WithCancel(ctx)
+		l4 := newL4Proxy(l4ctx, device.(*FdAdapter).file, hconn, ipConn)
+		l4started := l4.start()
+
 		errChan := make(chan error, 2)
 		var wg sync.WaitGroup
 		wg.Add(2)
-		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns) }()
+		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, l4) }()
 		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan) }()
 
 		isNetworkReconnect := false
@@ -490,7 +532,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			log.Println("reconnect requested")
 			if networkTriggered.Swap(false) {
 				isNetworkReconnect = true
-				backoff = 0
+				backoff = 200 * time.Millisecond // micro-delay lets new network's routing stabilize
 				networkGraceAttempts = networkGraceMax
 			} else {
 				backoff = minBackoff
@@ -498,6 +540,10 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		case <-ctx.Done():
 		}
 
+		l4cancel()
+		if l4started {
+			l4.stop()
+		}
 		cleanup(ipConn, udpConn, tr)
 		wg.Wait() // wait for forwarding goroutines to exit before reconnecting
 		if ctx.Err() != nil {
@@ -521,11 +567,14 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	}
 }
 
-// nextBackoff doubles the current backoff, capped at max.
+// nextBackoff doubles the current backoff, capped at max, with 0–25% random jitter.
 func nextBackoff(current, max time.Duration) time.Duration {
 	next := current * 2
 	if next > max {
-		return max
+		next = max
+	}
+	if quarter := int64(next) / 4; quarter > 0 {
+		next += time.Duration(mrand.Int64N(quarter))
 	}
 	return next
 }
@@ -541,8 +590,8 @@ func connectHappyEyeballs(
 	connectPort int,
 	connectUri string,
 	protector VpnProtector,
-) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
-	const connectionAttemptDelay = 50 * time.Millisecond
+) (*net.UDPConn, *http3.Transport, *http3.ClientConn, *connectip.Conn, *http.Response, error) {
+	const connectionAttemptDelay = 150 * time.Millisecond
 
 	// Build ordered endpoint list: IPv6 first, then IPv4.
 	var endpoints []taggedEndpoint
@@ -554,21 +603,21 @@ func connectHappyEyeballs(
 	}
 
 	if len(endpoints) == 0 {
-		return nil, nil, nil, nil, errors.New("no valid endpoints configured")
+		return nil, nil, nil, nil, nil, errors.New("no valid endpoints configured")
 	}
 
 	// Single endpoint — no racing needed.
 	if len(endpoints) == 1 {
 		ep := endpoints[0]
 		log.Printf("Connecting to %s (%s)", ep.addr, ep.tag)
-		udpConn, tr, ipConn, rsp, err := connectTunnelProtected(ctx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
+		udpConn, tr, hconn, ipConn, rsp, err := connectTunnelProtected(ctx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
 		if err != nil {
 			if udpConn != nil {
 				udpConn.Close()
 			}
-			return nil, nil, nil, nil, err
+			return nil, nil, nil, nil, nil, err
 		}
-		return udpConn, tr, ipConn, rsp, nil
+		return udpConn, tr, hconn, ipConn, rsp, nil
 	}
 
 	// Dual-stack: race with staggered start.
@@ -579,8 +628,8 @@ func connectHappyEyeballs(
 
 	attempt := func(ep taggedEndpoint) {
 		log.Printf("Connecting to %s (%s)", ep.addr, ep.tag)
-		udpConn, tr, ipConn, rsp, err := connectTunnelProtected(raceCtx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
-		r := connResult{udpConn: udpConn, tr: tr, ipConn: ipConn, rsp: rsp, err: err, tag: ep.tag}
+		udpConn, tr, hconn, ipConn, rsp, err := connectTunnelProtected(raceCtx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
+		r := connResult{udpConn: udpConn, tr: tr, hconn: hconn, ipConn: ipConn, rsp: rsp, err: err, tag: ep.tag}
 		// Treat non-200 as failure for racing purposes.
 		if err == nil && rsp.StatusCode != 200 {
 			r.err = fmt.Errorf("tunnel rejected: %s", rsp.Status)
@@ -599,7 +648,7 @@ func connectHappyEyeballs(
 	case r := <-ch:
 		if r.err == nil {
 			// First attempt won — no need to start second.
-			return r.udpConn, r.tr, r.ipConn, r.rsp, nil
+			return r.udpConn, r.tr, r.hconn, r.ipConn, r.rsp, nil
 		}
 		// First attempt failed — start fallback immediately.
 		log.Printf("%s failed: %v", r.tag, r.err)
@@ -611,7 +660,7 @@ func connectHappyEyeballs(
 		// Delay expired — start second attempt in parallel.
 		go attempt(endpoints[1])
 	case <-ctx.Done():
-		return nil, nil, nil, nil, ctx.Err()
+		return nil, nil, nil, nil, nil, ctx.Err()
 	}
 
 	// Collect results: up to 2 attempts may be in flight.
@@ -622,7 +671,7 @@ func connectHappyEyeballs(
 			if r.err == nil {
 				// Winner — cancel the other attempt and return.
 				raceCancel()
-				return r.udpConn, r.tr, r.ipConn, r.rsp, nil
+				return r.udpConn, r.tr, r.hconn, r.ipConn, r.rsp, nil
 			}
 			log.Printf("%s failed: %v", r.tag, r.err)
 			if r.udpConn != nil {
@@ -630,10 +679,10 @@ func connectHappyEyeballs(
 			}
 			lastErr = r.err
 		case <-ctx.Done():
-			return nil, nil, nil, nil, ctx.Err()
+			return nil, nil, nil, nil, nil, ctx.Err()
 		}
 	}
-	return nil, nil, nil, nil, lastErr
+	return nil, nil, nil, nil, nil, lastErr
 }
 
 // connectTunnelProtected mirrors api.ConnectTunnel but protects the UDP
@@ -645,7 +694,7 @@ func connectTunnelProtected(
 	endpoint *net.UDPAddr,
 	connectUri string,
 	protector VpnProtector,
-) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
+) (*net.UDPConn, *http3.Transport, *http3.ClientConn, *connectip.Conn, *http.Response, error) {
 	// Create UDP socket
 	listenAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
 	if endpoint.IP.To4() == nil {
@@ -653,14 +702,14 @@ func connectTunnelProtected(
 	}
 	udpConn, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("UDP socket: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("UDP socket: %w", err)
 	}
 
 	// Protect before QUIC handshake
 	rawConn, err := udpConn.SyscallConn()
 	if err != nil {
 		udpConn.Close()
-		return nil, nil, nil, nil, fmt.Errorf("raw conn: %w", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("raw conn: %w", err)
 	}
 	var protectErr error
 	rawConn.Control(func(fd uintptr) {
@@ -670,14 +719,14 @@ func connectTunnelProtected(
 	})
 	if protectErr != nil {
 		udpConn.Close()
-		return nil, nil, nil, nil, protectErr
+		return nil, nil, nil, nil, nil, protectErr
 	}
 
 	// QUIC + Connect-IP (mirrors api.ConnectTunnel logic)
 	conn, err := quic.Dial(ctx, udpConn, endpoint, tlsConfig, quicConfig)
 	if err != nil {
 		udpConn.Close()
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, nil, err
 	}
 
 	tr := &http3.Transport{
@@ -692,12 +741,12 @@ func connectTunnelProtected(
 	ipConn, rsp, err := connectip.Dial(ctx, hconn, template, "cf-connect-ip", headers, true)
 	if err != nil {
 		udpConn.Close()
-		return nil, nil, nil, nil, fmt.Errorf("connect-ip: %v", err)
+		return nil, nil, nil, nil, nil, fmt.Errorf("connect-ip: %v", err)
 	}
-	return udpConn, tr, ipConn, rsp, nil
+	return udpConn, tr, hconn, ipConn, rsp, nil
 }
 
-func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor) {
+func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor, l4 *l4Proxy) {
 	for {
 		buf := pool.Get()
 		n, err := device.ReadPacket(buf)
@@ -712,28 +761,37 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 		// Intercept DNS packets (IPv4 and IPv6) when DoH is active
 		if dns != nil {
 			if srcIP, srcPort, dstIP, query, ok := isAnyDNSPacket(pkt); ok {
-				queryCopy := make([]byte, len(query))
-				copy(queryCopy, query)
+				bufPtr := dnsQueryPool.Get().(*[]byte)
+				queryCopy := append((*bufPtr)[:0], query...)
 				pool.Put(buf)
 				dns.forwardUp(dnsRequest{
 					srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
 					query: queryCopy, writeFunc: device.WritePacket,
+					poolBuf: bufPtr,
 				})
 				continue
 			}
 			if srcIP, srcPort, dstIP, query, ok := isAnyDNSv6Packet(pkt); ok {
-				queryCopy := make([]byte, len(query))
-				copy(queryCopy, query)
+				bufPtr := dnsQueryPool.Get().(*[]byte)
+				queryCopy := append((*bufPtr)[:0], query...)
 				pool.Put(buf)
 				dns.forwardUp(dnsRequest{
 					srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
 					query: queryCopy, writeFunc: device.WritePacket,
-					isIPv6: true,
+					isIPv6: true, poolBuf: bufPtr,
 				})
 				continue
 			}
 		}
 
+		// TCP packets → gvisor netstack for L4 proxying (avoids TCP-in-QUIC meltdown)
+		if l4 != nil && l4.active && isTCPPacket(pkt) {
+			l4.injectInbound(pkt)
+			pool.Put(buf)
+			continue
+		}
+
+		// Everything else → Connect-IP datagrams (UDP, ICMP, etc.)
 		icmp, err := ipConn.WritePacket(pkt)
 		pool.Put(buf)
 		if err != nil {
