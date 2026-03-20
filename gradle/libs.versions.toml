@@ -9,7 +9,7 @@ activityCompose = "1.12.4"
 kotlin = "2.3.10"
 composeBom = "2026.02.01"
 lifecycleViewmodelCompose = "2.10.0"
-datastorePreferences = "1.2.0"
+datastorePreferences = "1.2.1"
 navigationCompose = "2.9.7"
 accompanistDrawablepainter = "0.37.3"
 
