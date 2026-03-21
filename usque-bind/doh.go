@@ -5,6 +5,7 @@ import (
 	"container/list"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -33,12 +34,10 @@ var dnsResponsePool = sync.Pool{
 
 // dohProxy resolves DNS queries over HTTPS (RFC 8484).
 type dohProxy struct {
+	cachedResolver
 	url        string
 	client     *http.Client
 	clientMu   sync.Mutex           // protects client recreation
-	protector  VpnProtector
-	cache      *lruCache            // bounded LRU: query content -> *cacheEntry
-	refreshing sync.Map             // cache keys currently being background-refreshed
 	makeClient func() *http.Client  // factory for recreating client on network errors
 	preferGET  bool                 // flip to true on HTTP 405, stay on GET
 
@@ -51,13 +50,9 @@ type dohProxy struct {
 }
 
 type cacheEntry struct {
-	response      []byte
-	expiry        time.Time
-	staleDeadline time.Time
-	originalTTL   time.Duration
+	response []byte
+	expiry   time.Time
 }
-
-const staleGracePeriod = 30 * time.Minute
 
 // lruCache is a bounded, thread-safe LRU cache keyed by string.
 type lruCache struct {
@@ -116,6 +111,56 @@ func (c *lruCache) delete(key string) {
 		c.order.Remove(el)
 		delete(c.items, key)
 	}
+}
+
+// cachedResolver wraps a fetch function with an LRU DNS cache.
+// It handles transaction ID zeroing for cache keys and TTL-based expiry.
+type cachedResolver struct {
+	cache *lruCache
+	fetch func(query []byte) ([]byte, error)
+}
+
+func newCachedResolver(capacity int, fetch func([]byte) ([]byte, error)) *cachedResolver {
+	return &cachedResolver{cache: newLRUCache(capacity), fetch: fetch}
+}
+
+func (r *cachedResolver) resolve(query []byte) ([]byte, error) {
+	if len(query) < 12 {
+		return nil, errors.New("DNS query too short")
+	}
+
+	origID := [2]byte{query[0], query[1]}
+	query[0], query[1] = 0, 0
+
+	cacheKey := string(query)
+	if entry, ok := r.cache.get(cacheKey); ok {
+		if time.Now().Before(entry.expiry) {
+			resp := make([]byte, len(entry.response))
+			copy(resp, entry.response)
+			resp[0], resp[1] = origID[0], origID[1]
+			query[0], query[1] = origID[0], origID[1]
+			return resp, nil
+		}
+		r.cache.delete(cacheKey)
+	}
+
+	body, err := r.fetch(query)
+	if err != nil {
+		query[0], query[1] = origID[0], origID[1]
+		return nil, err
+	}
+
+	cacheCopy := make([]byte, len(body))
+	copy(cacheCopy, body)
+	cacheCopy[0], cacheCopy[1] = 0, 0
+	r.cache.put(cacheKey, &cacheEntry{
+		response: cacheCopy,
+		expiry:   time.Now().Add(extractMinTTL(body)),
+	})
+
+	body[0], body[1] = origID[0], origID[1]
+	query[0], query[1] = origID[0], origID[1]
+	return body, nil
 }
 
 // warmupQuery is a minimal DNS query for "." (root) NS record, used to pre-warm the connection.
@@ -192,20 +237,9 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 					return nil, err
 				}
 				// Protect socket from VPN routing
-				rawConn, err := udpConn.SyscallConn()
-				if err != nil {
+				if err := protectUDPConn(udpConn, protector); err != nil {
 					udpConn.Close()
 					return nil, err
-				}
-				var protectErr error
-				rawConn.Control(func(fd uintptr) {
-					if !protector.ProtectFd(int(fd)) {
-						protectErr = errors.New("VPN protect() failed for H3 socket")
-					}
-				})
-				if protectErr != nil {
-					udpConn.Close()
-					return nil, protectErr
 				}
 				if cfg == nil {
 					cfg = &quic.Config{}
@@ -221,90 +255,14 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 		}
 	}
 
-	return &dohProxy{
+	d := &dohProxy{
 		url:          url,
-		protector:    protector,
 		client:       makeClient(),
 		makeClient:   makeClient,
 		makeH3Client: makeH3Client,
-		cache:        newLRUCache(1024),
 	}
-}
-
-// resolve sends a DNS query to the DoH server and returns the raw DNS response.
-func (d *dohProxy) resolve(query []byte) ([]byte, error) {
-	if len(query) < 12 {
-		return nil, errors.New("DNS query too short")
-	}
-
-	// Save original transaction ID and zero it for cache key
-	origID := [2]byte{query[0], query[1]}
-	query[0], query[1] = 0, 0
-
-	cacheKey := string(query)
-	if entry, ok := d.cache.get(cacheKey); ok {
-		now := time.Now()
-		if now.Before(entry.expiry) {
-			// Fresh hit — return immediately
-			resp := make([]byte, len(entry.response))
-			copy(resp, entry.response)
-			resp[0], resp[1] = origID[0], origID[1]
-			query[0], query[1] = origID[0], origID[1]
-			// Proactive refresh at 75% TTL for popular entries
-			if entry.originalTTL > 0 {
-				refreshAt := entry.expiry.Add(-entry.originalTTL / 4)
-				if now.After(refreshAt) {
-					if _, loaded := d.refreshing.LoadOrStore(cacheKey, struct{}{}); !loaded {
-						queryCopy := make([]byte, len(query))
-						copy(queryCopy, query)
-						queryCopy[0], queryCopy[1] = 0, 0
-						go d.backgroundRefresh(cacheKey, queryCopy)
-					}
-				}
-			}
-			return resp, nil
-		}
-		if now.Before(entry.staleDeadline) {
-			// Stale hit — return immediately, refresh in background
-			resp := make([]byte, len(entry.response))
-			copy(resp, entry.response)
-			resp[0], resp[1] = origID[0], origID[1]
-			query[0], query[1] = origID[0], origID[1]
-			if _, loaded := d.refreshing.LoadOrStore(cacheKey, struct{}{}); !loaded {
-				queryCopy := make([]byte, len(query))
-				copy(queryCopy, query)
-				queryCopy[0], queryCopy[1] = 0, 0
-				go d.backgroundRefresh(cacheKey, queryCopy)
-			}
-			return resp, nil
-		}
-		// Fully expired — delete and fall through to network fetch
-		d.cache.delete(cacheKey)
-	}
-
-	body, err := d.fetchFromServer(query)
-	if err != nil {
-		query[0], query[1] = origID[0], origID[1]
-		return nil, err
-	}
-
-	// Cache with zeroed transaction ID
-	cacheCopy := make([]byte, len(body))
-	copy(cacheCopy, body)
-	cacheCopy[0], cacheCopy[1] = 0, 0
-	ttl := extractMinTTL(body)
-	now := time.Now()
-	d.cache.put(cacheKey, &cacheEntry{
-		response:      cacheCopy,
-		expiry:        now.Add(ttl),
-		staleDeadline: now.Add(ttl + staleGracePeriod),
-		originalTTL:   ttl,
-	})
-
-	// Patch caller's original ID into response
-	body[0], body[1] = origID[0], origID[1]
-	query[0], query[1] = origID[0], origID[1]
-	return body, nil
+	d.cachedResolver = *newCachedResolver(1024, d.fetchFromServer)
+	return d
 }
 
 // fetchWithClient sends a DNS query using the given HTTP client with retries.
@@ -423,29 +381,6 @@ func (d *dohProxy) probeH3() {
 	d.useH3.Store(true)
 }
 
-// backgroundRefresh fetches a fresh response for the given cache key and updates the cache.
-func (d *dohProxy) backgroundRefresh(cacheKey string, query []byte) {
-	defer d.refreshing.Delete(cacheKey)
-
-	body, err := d.fetchFromServer(query)
-	if err != nil {
-		log.Printf("DNS background refresh error: %v", err)
-		return
-	}
-
-	cacheCopy := make([]byte, len(body))
-	copy(cacheCopy, body)
-	cacheCopy[0], cacheCopy[1] = 0, 0
-	ttl := extractMinTTL(body)
-	now := time.Now()
-	d.cache.put(cacheKey, &cacheEntry{
-		response:      cacheCopy,
-		expiry:        now.Add(ttl),
-		staleDeadline: now.Add(ttl + staleGracePeriod),
-		originalTTL:   ttl,
-	})
-}
-
 // warmConnection pre-establishes the TCP+TLS+HTTP/2 connection by sending a root NS query.
 func (d *dohProxy) warmConnection() {
 	go func() {
@@ -464,7 +399,7 @@ func (d *dohProxy) buildPOSTRequest(query []byte) (*http.Request, error) {
 }
 
 func (d *dohProxy) buildGETRequest(query []byte) (*http.Request, error) {
-	encoded := base64RawURLEncode(query)
+	encoded := base64.RawURLEncoding.EncodeToString(query)
 	reqURL := d.url + "?dns=" + encoded
 	req, err := http.NewRequest("GET", reqURL, nil)
 	if err != nil {
@@ -472,38 +407,6 @@ func (d *dohProxy) buildGETRequest(query []byte) (*http.Request, error) {
 	}
 	req.Header.Set("Accept", "application/dns-message")
 	return req, nil
-}
-
-// base64RawURLEncode encodes bytes to base64url without padding (RFC 4648 §5).
-func base64RawURLEncode(src []byte) string {
-	const encode = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
-	buf := make([]byte, ((len(src)+2)/3)*4)
-	n := 0
-	for i := 0; i < len(src); i += 3 {
-		var val uint32
-		remaining := len(src) - i
-		switch {
-		case remaining >= 3:
-			val = uint32(src[i])<<16 | uint32(src[i+1])<<8 | uint32(src[i+2])
-			buf[n] = encode[val>>18&0x3f]
-			buf[n+1] = encode[val>>12&0x3f]
-			buf[n+2] = encode[val>>6&0x3f]
-			buf[n+3] = encode[val&0x3f]
-			n += 4
-		case remaining == 2:
-			val = uint32(src[i])<<16 | uint32(src[i+1])<<8
-			buf[n] = encode[val>>18&0x3f]
-			buf[n+1] = encode[val>>12&0x3f]
-			buf[n+2] = encode[val>>6&0x3f]
-			n += 3
-		case remaining == 1:
-			val = uint32(src[i]) << 16
-			buf[n] = encode[val>>18&0x3f]
-			buf[n+1] = encode[val>>12&0x3f]
-			n += 2
-		}
-	}
-	return string(buf[:n])
 }
 
 // isRetryableError returns true for transient errors worth retrying (EOF, connection reset).
@@ -533,16 +436,10 @@ func padQuery(query []byte) []byte {
 	binary.BigEndian.PutUint16(opt[2:4], uint16(padLen))  // option length
 	// opt[4:] is already zeroed
 
-	// Update OPT record RDLENGTH (last OPT record in additional section)
-	// The OPT RDLENGTH is at the end of the fixed OPT fields, before RDATA
-	// We need to find and update it
+	// Append padding to the OPT record and update its RDLENGTH
 	result := make([]byte, len(query)+len(opt))
 	copy(result, query)
-	// Update RDLENGTH of the OPT record
-	// OPT record ends at len(query), RDLENGTH is at len(query)-2 relative to RDATA start
-	// Actually, we appended OPT in ensureEDNS0 with RDLENGTH=0 at the end
-	// The RDLENGTH field is 2 bytes before the end of the current query (before any RDATA)
-	rdlenOffset := len(query) - 2
+	rdlenOffset := len(query) - 2 // RDLENGTH is the last 2 bytes of the OPT record
 	if rdlenOffset >= 12 {
 		existingRDLen := binary.BigEndian.Uint16(query[rdlenOffset : rdlenOffset+2])
 		binary.BigEndian.PutUint16(result[rdlenOffset:rdlenOffset+2], existingRDLen+uint16(len(opt)))
@@ -590,7 +487,6 @@ func ensureEDNS0(query []byte) []byte {
 	}
 	// Check additional section for OPT (type 41)
 	for i := 0; i < int(arcount); i++ {
-		rrStart := offset
 		offset = skipDNSName(query, offset)
 		if offset < 0 || offset+10 > len(query) {
 			return query
@@ -602,7 +498,6 @@ func ensureEDNS0(query []byte) []byte {
 		}
 		rdlen := binary.BigEndian.Uint16(query[offset+8 : offset+10])
 		offset = offset + 10 + int(rdlen)
-		_ = rrStart
 	}
 
 	// Append minimal OPT pseudo-record: name=0x00, type=41, class=4096(UDP size), TTL=0, RDLENGTH=0
@@ -673,7 +568,7 @@ func ipChecksum(header []byte) uint16 {
 	return ^uint16(sum)
 }
 
-// extractMinTTL parses a DNS response to find the minimum TTL, clamped to [60s, 600s].
+// extractMinTTL parses a DNS response to find the minimum TTL, clamped to [60s, 1800s].
 func extractMinTTL(resp []byte) time.Duration {
 	const minTTL = 60 * time.Second
 	const maxTTL = 1800 * time.Second
@@ -781,114 +676,25 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 			doh.warmConnection()
 		},
 	}
-
-	// Bounded worker pool for DNS resolution.
-	const numWorkers = 4
-	for i := 0; i < numWorkers; i++ {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case req, ok := <-d.reqCh:
-					if !ok {
-						return
-					}
-					d.handleInterceptedDNS(req)
-				}
-			}
-		}()
-	}
+	d.startWorkers(ctx, 4)
 
 	return d
 }
 
 // systemDnsResolver forwards DNS queries via protected UDP sockets to system DNS servers.
 type systemDnsResolver struct {
+	cachedResolver
 	servers   []string
 	protector VpnProtector
-	cache     *lruCache
-	refreshing sync.Map
 }
 
 func newSystemDnsResolver(servers []string, protector VpnProtector) *systemDnsResolver {
-	return &systemDnsResolver{
+	s := &systemDnsResolver{
 		servers:   servers,
 		protector: protector,
-		cache:     newLRUCache(1024),
 	}
-}
-
-// resolve sends a DNS query to system DNS servers via protected UDP sockets.
-func (s *systemDnsResolver) resolve(query []byte) ([]byte, error) {
-	if len(query) < 12 {
-		return nil, errors.New("DNS query too short")
-	}
-
-	// Save original transaction ID and zero it for cache key
-	origID := [2]byte{query[0], query[1]}
-	query[0], query[1] = 0, 0
-
-	cacheKey := string(query)
-	if entry, ok := s.cache.get(cacheKey); ok {
-		now := time.Now()
-		if now.Before(entry.expiry) {
-			resp := make([]byte, len(entry.response))
-			copy(resp, entry.response)
-			resp[0], resp[1] = origID[0], origID[1]
-			query[0], query[1] = origID[0], origID[1]
-			// Proactive refresh at 75% TTL
-			if entry.originalTTL > 0 {
-				refreshAt := entry.expiry.Add(-entry.originalTTL / 4)
-				if now.After(refreshAt) {
-					if _, loaded := s.refreshing.LoadOrStore(cacheKey, struct{}{}); !loaded {
-						queryCopy := make([]byte, len(query))
-						copy(queryCopy, query)
-						queryCopy[0], queryCopy[1] = 0, 0
-						go s.backgroundRefresh(cacheKey, queryCopy)
-					}
-				}
-			}
-			return resp, nil
-		}
-		if now.Before(entry.staleDeadline) {
-			resp := make([]byte, len(entry.response))
-			copy(resp, entry.response)
-			resp[0], resp[1] = origID[0], origID[1]
-			query[0], query[1] = origID[0], origID[1]
-			if _, loaded := s.refreshing.LoadOrStore(cacheKey, struct{}{}); !loaded {
-				queryCopy := make([]byte, len(query))
-				copy(queryCopy, query)
-				queryCopy[0], queryCopy[1] = 0, 0
-				go s.backgroundRefresh(cacheKey, queryCopy)
-			}
-			return resp, nil
-		}
-		s.cache.delete(cacheKey)
-	}
-
-	body, err := s.queryServers(query)
-	if err != nil {
-		query[0], query[1] = origID[0], origID[1]
-		return nil, err
-	}
-
-	// Cache with zeroed transaction ID
-	cacheCopy := make([]byte, len(body))
-	copy(cacheCopy, body)
-	cacheCopy[0], cacheCopy[1] = 0, 0
-	ttl := extractMinTTL(body)
-	now := time.Now()
-	s.cache.put(cacheKey, &cacheEntry{
-		response:      cacheCopy,
-		expiry:        now.Add(ttl),
-		staleDeadline: now.Add(ttl + staleGracePeriod),
-		originalTTL:   ttl,
-	})
-
-	body[0], body[1] = origID[0], origID[1]
-	query[0], query[1] = origID[0], origID[1]
-	return body, nil
+	s.cachedResolver = *newCachedResolver(1024, s.queryServers)
+	return s
 }
 
 // queryServers sends a DNS query to each configured server until one succeeds.
@@ -925,18 +731,8 @@ func (s *systemDnsResolver) queryServer(server string, query []byte) ([]byte, er
 	defer conn.Close()
 
 	// Protect socket from VPN routing
-	rawConn, err := conn.SyscallConn()
-	if err != nil {
-		return nil, fmt.Errorf("syscall conn: %w", err)
-	}
-	var protectErr error
-	rawConn.Control(func(fd uintptr) {
-		if !s.protector.ProtectFd(int(fd)) {
-			protectErr = errors.New("VPN protect() failed for DNS socket")
-		}
-	})
-	if protectErr != nil {
-		return nil, protectErr
+	if err := protectUDPConn(conn, s.protector); err != nil {
+		return nil, err
 	}
 
 	conn.SetDeadline(time.Now().Add(2 * time.Second))
@@ -961,28 +757,6 @@ func (s *systemDnsResolver) queryServer(server string, query []byte) ([]byte, er
 	return resp, nil
 }
 
-func (s *systemDnsResolver) backgroundRefresh(cacheKey string, query []byte) {
-	defer s.refreshing.Delete(cacheKey)
-
-	body, err := s.queryServers(query)
-	if err != nil {
-		log.Printf("System DNS background refresh error: %v", err)
-		return
-	}
-
-	cacheCopy := make([]byte, len(body))
-	copy(cacheCopy, body)
-	cacheCopy[0], cacheCopy[1] = 0, 0
-	ttl := extractMinTTL(body)
-	now := time.Now()
-	s.cache.put(cacheKey, &cacheEntry{
-		response:      cacheCopy,
-		expiry:        now.Add(ttl),
-		staleDeadline: now.Add(ttl + staleGracePeriod),
-		originalTTL:   ttl,
-	})
-}
-
 // newSystemDnsInterceptor creates a dnsInterceptor that forwards DNS queries
 // to system DNS servers via protected UDP sockets (bypassing the VPN).
 func newSystemDnsInterceptor(ctx context.Context, servers []string, protector VpnProtector) *dnsInterceptor {
@@ -993,13 +767,17 @@ func newSystemDnsInterceptor(ctx context.Context, servers []string, protector Vp
 	resolver := newSystemDnsResolver(servers, protector)
 
 	d := &dnsInterceptor{
-		resolver:  resolver.resolve,
-		reqCh:     make(chan dnsRequest, 256),
-		resetFunc: nil, // no persistent connections to reset
+		resolver: resolver.resolve,
+		reqCh:    make(chan dnsRequest, 256),
 	}
+	d.startWorkers(ctx, 4)
 
-	const numWorkers = 4
-	for i := 0; i < numWorkers; i++ {
+	return d
+}
+
+// startWorkers launches n goroutines to process DNS requests from reqCh.
+func (d *dnsInterceptor) startWorkers(ctx context.Context, n int) {
+	for i := 0; i < n; i++ {
 		go func() {
 			for {
 				select {
@@ -1014,8 +792,6 @@ func newSystemDnsInterceptor(ctx context.Context, servers []string, protector Vp
 			}
 		}()
 	}
-
-	return d
 }
 
 // forwardUp queues a DNS request for processing. Drops the request if the queue is full.
@@ -1172,6 +948,16 @@ func udp6Checksum(srcIP, dstIP, udpSegment []byte) uint16 {
 	return csum
 }
 
+// detectDNSQuery checks if pkt is a DNS query (IPv4 or IPv6 UDP to port 53).
+func detectDNSQuery(pkt []byte) (srcIP net.IP, srcPort uint16, dstIP net.IP, query []byte, isIPv6 bool, ok bool) {
+	if srcIP, srcPort, dstIP, query, ok = isAnyDNSPacket(pkt); ok {
+		return
+	}
+	srcIP, srcPort, dstIP, query, ok = isAnyDNSv6Packet(pkt)
+	isIPv6 = ok
+	return
+}
+
 // isAnyDNSPacket checks if pkt is an IPv4 UDP packet destined for ANY IP on port 53.
 // Returns srcIP, srcPort, dstIP, DNS payload, and true if it matches.
 func isAnyDNSPacket(pkt []byte) (srcIP net.IP, srcPort uint16, dstIP net.IP, payload []byte, ok bool) {
@@ -1196,9 +982,9 @@ func isAnyDNSPacket(pkt []byte) (srcIP net.IP, srcPort uint16, dstIP net.IP, pay
 		return nil, 0, nil, nil, false
 	}
 
-	srcIP = net.IP(pkt[12:16]).To4()
+	srcIP = append(net.IP(nil), pkt[12:16]...)
 	srcPort = binary.BigEndian.Uint16(pkt[ihl : ihl+2])
-	dstIP = net.IP(pkt[16:20]).To4()
+	dstIP = append(net.IP(nil), pkt[16:20]...)
 	payload = pkt[ihl+8:]
 	ok = true
 	return
@@ -1319,17 +1105,8 @@ func newTunnelDnsCache(capacity int) *tunnelDnsCache {
 // checkAndRespond checks a DNS query packet against the cache.
 // Returns true if a cached response was written to TUN (cache hit).
 func (c *tunnelDnsCache) checkAndRespond(pkt []byte, writeFunc func([]byte) error) bool {
-	var srcIP, dstIP net.IP
-	var srcPort uint16
-	var query []byte
-	var isIPv6 bool
-
-	if s, sp, d, q, ok := isAnyDNSPacket(pkt); ok {
-		srcIP, srcPort, dstIP, query = s, sp, d, q
-	} else if s, sp, d, q, ok := isAnyDNSv6Packet(pkt); ok {
-		srcIP, srcPort, dstIP, query = s, sp, d, q
-		isIPv6 = true
-	} else {
+	srcIP, srcPort, dstIP, query, isIPv6, ok := detectDNSQuery(pkt)
+	if !ok {
 		return false
 	}
 
@@ -1347,8 +1124,7 @@ func (c *tunnelDnsCache) checkAndRespond(pkt []byte, writeFunc func([]byte) erro
 		return false
 	}
 
-	now := time.Now()
-	if now.After(entry.staleDeadline) {
+	if time.Now().After(entry.expiry) {
 		c.cache.delete(key)
 		return false
 	}
@@ -1401,17 +1177,13 @@ func (c *tunnelDnsCache) cacheResponse(pkt []byte) {
 		return
 	}
 
-	ttl := extractMinTTL(payload)
 	cacheCopy := make([]byte, len(payload))
 	copy(cacheCopy, payload)
 	cacheCopy[0], cacheCopy[1] = 0, 0
 
-	now := time.Now()
 	c.cache.put(key, &cacheEntry{
-		response:      cacheCopy,
-		expiry:        now.Add(ttl),
-		staleDeadline: now.Add(ttl + staleGracePeriod),
-		originalTTL:   ttl,
+		response: cacheCopy,
+		expiry:   time.Now().Add(extractMinTTL(payload)),
 	})
 }
 

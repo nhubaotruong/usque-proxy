@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"strings"
 	"sync"
@@ -18,10 +17,7 @@ import (
 
 // doqProxy resolves DNS queries over QUIC (RFC 9250).
 type doqProxy struct {
-	addr      string
-	protector VpnProtector
-	cache     *lruCache
-	refreshing sync.Map
+	cachedResolver
 
 	mu      sync.Mutex
 	conn    *quic.Conn
@@ -41,11 +37,7 @@ func newDoqProxy(addr string, protector VpnProtector) *doqProxy {
 		port = "853"
 	}
 
-	d := &doqProxy{
-		addr:      net.JoinHostPort(host, port),
-		protector: protector,
-		cache:     newLRUCache(1024),
-	}
+	d := new(doqProxy)
 
 	d.makeConn = func() (*quic.Conn, *net.UDPConn, error) {
 		udpAddr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(host, port))
@@ -64,20 +56,9 @@ func newDoqProxy(addr string, protector VpnProtector) *doqProxy {
 		}
 
 		// Protect socket from VPN routing
-		rawConn, err := udpConn.SyscallConn()
-		if err != nil {
+		if err := protectUDPConn(udpConn, protector); err != nil {
 			udpConn.Close()
-			return nil, nil, fmt.Errorf("DoQ raw conn: %w", err)
-		}
-		var protectErr error
-		rawConn.Control(func(fd uintptr) {
-			if !protector.ProtectFd(int(fd)) {
-				protectErr = errors.New("VPN protect() failed for DoQ socket")
-			}
-		})
-		if protectErr != nil {
-			udpConn.Close()
-			return nil, nil, protectErr
+			return nil, nil, err
 		}
 
 		tlsCfg := &tls.Config{
@@ -103,6 +84,7 @@ func newDoqProxy(addr string, protector VpnProtector) *doqProxy {
 		return conn, udpConn, nil
 	}
 
+	d.cachedResolver = *newCachedResolver(1024, d.fetchFromServer)
 	return d
 }
 
@@ -163,17 +145,13 @@ func (d *doqProxy) doFetch(query []byte) ([]byte, error) {
 	}
 
 	// Write 2-byte length prefix + query (RFC 9250 §4.2)
-	lenBuf := make([]byte, 2)
-	binary.BigEndian.PutUint16(lenBuf, uint16(len(query)))
-	if _, err := stream.Write(lenBuf); err != nil {
+	msg := make([]byte, 2+len(query))
+	binary.BigEndian.PutUint16(msg, uint16(len(query)))
+	copy(msg[2:], query)
+	if _, err := stream.Write(msg); err != nil {
 		stream.CancelRead(0)
 		stream.CancelWrite(0)
-		return nil, fmt.Errorf("DoQ write len: %w", err)
-	}
-	if _, err := stream.Write(query); err != nil {
-		stream.CancelRead(0)
-		stream.CancelWrite(0)
-		return nil, fmt.Errorf("DoQ write query: %w", err)
+		return nil, fmt.Errorf("DoQ write: %w", err)
 	}
 	// Send FIN to indicate we're done writing
 	stream.Close()
@@ -194,99 +172,6 @@ func (d *doqProxy) doFetch(query []byte) ([]byte, error) {
 	}
 
 	return resp, nil
-}
-
-// resolve sends a DNS query via DoQ with caching (same pattern as dohProxy.resolve).
-func (d *doqProxy) resolve(query []byte) ([]byte, error) {
-	if len(query) < 12 {
-		return nil, errors.New("DNS query too short")
-	}
-
-	// Save original transaction ID and zero it for cache key
-	origID := [2]byte{query[0], query[1]}
-	query[0], query[1] = 0, 0
-
-	cacheKey := string(query)
-	if entry, ok := d.cache.get(cacheKey); ok {
-		now := time.Now()
-		if now.Before(entry.expiry) {
-			resp := make([]byte, len(entry.response))
-			copy(resp, entry.response)
-			resp[0], resp[1] = origID[0], origID[1]
-			query[0], query[1] = origID[0], origID[1]
-			// Proactive refresh at 75% TTL
-			if entry.originalTTL > 0 {
-				refreshAt := entry.expiry.Add(-entry.originalTTL / 4)
-				if now.After(refreshAt) {
-					if _, loaded := d.refreshing.LoadOrStore(cacheKey, struct{}{}); !loaded {
-						queryCopy := make([]byte, len(query))
-						copy(queryCopy, query)
-						queryCopy[0], queryCopy[1] = 0, 0
-						go d.backgroundRefresh(cacheKey, queryCopy)
-					}
-				}
-			}
-			return resp, nil
-		}
-		if now.Before(entry.staleDeadline) {
-			resp := make([]byte, len(entry.response))
-			copy(resp, entry.response)
-			resp[0], resp[1] = origID[0], origID[1]
-			query[0], query[1] = origID[0], origID[1]
-			if _, loaded := d.refreshing.LoadOrStore(cacheKey, struct{}{}); !loaded {
-				queryCopy := make([]byte, len(query))
-				copy(queryCopy, query)
-				queryCopy[0], queryCopy[1] = 0, 0
-				go d.backgroundRefresh(cacheKey, queryCopy)
-			}
-			return resp, nil
-		}
-		d.cache.delete(cacheKey)
-	}
-
-	body, err := d.fetchFromServer(query)
-	if err != nil {
-		query[0], query[1] = origID[0], origID[1]
-		return nil, err
-	}
-
-	cacheCopy := make([]byte, len(body))
-	copy(cacheCopy, body)
-	cacheCopy[0], cacheCopy[1] = 0, 0
-	ttl := extractMinTTL(body)
-	now := time.Now()
-	d.cache.put(cacheKey, &cacheEntry{
-		response:      cacheCopy,
-		expiry:        now.Add(ttl),
-		staleDeadline: now.Add(ttl + staleGracePeriod),
-		originalTTL:   ttl,
-	})
-
-	body[0], body[1] = origID[0], origID[1]
-	query[0], query[1] = origID[0], origID[1]
-	return body, nil
-}
-
-func (d *doqProxy) backgroundRefresh(cacheKey string, query []byte) {
-	defer d.refreshing.Delete(cacheKey)
-
-	body, err := d.fetchFromServer(query)
-	if err != nil {
-		log.Printf("DoQ background refresh error: %v", err)
-		return
-	}
-
-	cacheCopy := make([]byte, len(body))
-	copy(cacheCopy, body)
-	cacheCopy[0], cacheCopy[1] = 0, 0
-	ttl := extractMinTTL(body)
-	now := time.Now()
-	d.cache.put(cacheKey, &cacheEntry{
-		response:      cacheCopy,
-		expiry:        now.Add(ttl),
-		staleDeadline: now.Add(ttl + staleGracePeriod),
-		originalTTL:   ttl,
-	})
 }
 
 // resetConn closes the QUIC connection and UDP socket.
@@ -340,23 +225,7 @@ func newDoqDnsInterceptor(ctx context.Context, doqAddr string, protector VpnProt
 			doq.warmConnection()
 		},
 	}
-
-	const numWorkers = 4
-	for i := 0; i < numWorkers; i++ {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case req, ok := <-d.reqCh:
-					if !ok {
-						return
-					}
-					d.handleInterceptedDNS(req)
-				}
-			}
-		}()
-	}
+	d.startWorkers(ctx, 4)
 
 	return d
 }

@@ -53,7 +53,6 @@ type taggedEndpoint struct {
 type connResult struct {
 	udpConn *net.UDPConn
 	tr      *http3.Transport
-	hconn   *http3.ClientConn
 	ipConn  *connectip.Conn
 	rsp     *http.Response
 	err     error
@@ -241,48 +240,7 @@ func Register(license string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("registration failed: %w", err)
 	}
-
-	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return "", fmt.Errorf("key generation failed: %w", err)
-	}
-	privKeyDER, err := x509.MarshalECPrivateKey(privKey)
-	if err != nil {
-		return "", fmt.Errorf("private key marshal failed: %w", err)
-	}
-	pubKeyPKIX, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
-	if err != nil {
-		return "", fmt.Errorf("public key marshal failed: %w", err)
-	}
-
-	updatedAccount, apiErr, err := api.EnrollKey(accountData, pubKeyPKIX, "UsqueProxy")
-	if err != nil {
-		if apiErr != nil {
-			return "", fmt.Errorf("key enrollment failed: %s", apiErr.ErrorsAsString("; "))
-		}
-		return "", fmt.Errorf("key enrollment failed: %w", err)
-	}
-
-	cfg := config.Config{
-		PrivateKey:  base64.StdEncoding.EncodeToString(privKeyDER),
-		ID:          accountData.ID,
-		AccessToken: accountData.Token,
-		License:     license,
-	}
-	if len(updatedAccount.Config.Peers) > 0 {
-		peer := updatedAccount.Config.Peers[0]
-		cfg.EndpointPubKey = peer.PublicKey
-		cfg.EndpointV4 = cleanEndpoint(peer.Endpoint.V4)
-		cfg.EndpointV6 = cleanEndpoint(peer.Endpoint.V6)
-	}
-	cfg.IPv4 = updatedAccount.Config.Interface.Addresses.V4
-	cfg.IPv6 = updatedAccount.Config.Interface.Addresses.V6
-
-	result, err := json.Marshal(cfg)
-	if err != nil {
-		return "", fmt.Errorf("failed to serialize config: %w", err)
-	}
-	return string(result), nil
+	return enrollAndBuildConfig(accountData, license)
 }
 
 // RegisterWithJWT performs ZeroTrust device registration using a JWT token
@@ -293,41 +251,24 @@ func RegisterWithJWT(jwt string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("registration failed: %w", err)
 	}
+	return enrollAndBuildConfig(accountData, "")
+}
 
-	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+// enrollAndBuildConfig generates a key pair, enrolls it with the API, and
+// returns the serialized config JSON.
+func enrollAndBuildConfig(accountData models.AccountData, license string) (string, error) {
+	privKeyDER, updatedAccount, err := generateAndEnroll(accountData)
 	if err != nil {
-		return "", fmt.Errorf("key generation failed: %w", err)
-	}
-	privKeyDER, err := x509.MarshalECPrivateKey(privKey)
-	if err != nil {
-		return "", fmt.Errorf("private key marshal failed: %w", err)
-	}
-	pubKeyPKIX, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
-	if err != nil {
-		return "", fmt.Errorf("public key marshal failed: %w", err)
-	}
-
-	updatedAccount, apiErr, err := api.EnrollKey(accountData, pubKeyPKIX, "UsqueProxy")
-	if err != nil {
-		if apiErr != nil {
-			return "", fmt.Errorf("key enrollment failed: %s", apiErr.ErrorsAsString("; "))
-		}
-		return "", fmt.Errorf("key enrollment failed: %w", err)
+		return "", err
 	}
 
 	cfg := config.Config{
 		PrivateKey:  base64.StdEncoding.EncodeToString(privKeyDER),
 		ID:          accountData.ID,
 		AccessToken: accountData.Token,
+		License:     license,
 	}
-	if len(updatedAccount.Config.Peers) > 0 {
-		peer := updatedAccount.Config.Peers[0]
-		cfg.EndpointPubKey = peer.PublicKey
-		cfg.EndpointV4 = cleanEndpoint(peer.Endpoint.V4)
-		cfg.EndpointV6 = cleanEndpoint(peer.Endpoint.V6)
-	}
-	cfg.IPv4 = updatedAccount.Config.Interface.Addresses.V4
-	cfg.IPv6 = updatedAccount.Config.Interface.Addresses.V6
+	applyAccountToConfig(&cfg, updatedAccount)
 
 	result, err := json.Marshal(cfg)
 	if err != nil {
@@ -348,43 +289,57 @@ func Enroll(configJSON string) (string, error) {
 		return "", errors.New("config must contain id and access_token")
 	}
 
-	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return "", fmt.Errorf("key generation failed: %w", err)
-	}
-	privKeyDER, err := x509.MarshalECPrivateKey(privKey)
-	if err != nil {
-		return "", fmt.Errorf("private key marshal failed: %w", err)
-	}
-	pubKeyPKIX, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
-	if err != nil {
-		return "", fmt.Errorf("public key marshal failed: %w", err)
-	}
-
 	accountData := models.AccountData{ID: cfg.ID, Token: cfg.AccessToken}
-	updatedAccount, apiErr, err := api.EnrollKey(accountData, pubKeyPKIX, "UsqueProxy")
+	privKeyDER, updatedAccount, err := generateAndEnroll(accountData)
 	if err != nil {
-		if apiErr != nil {
-			return "", fmt.Errorf("re-enrollment failed: %s", apiErr.ErrorsAsString("; "))
-		}
-		return "", fmt.Errorf("re-enrollment failed: %w", err)
+		return "", err
 	}
 
 	cfg.PrivateKey = base64.StdEncoding.EncodeToString(privKeyDER)
-	if len(updatedAccount.Config.Peers) > 0 {
-		peer := updatedAccount.Config.Peers[0]
-		cfg.EndpointPubKey = peer.PublicKey
-		cfg.EndpointV4 = cleanEndpoint(peer.Endpoint.V4)
-		cfg.EndpointV6 = cleanEndpoint(peer.Endpoint.V6)
-	}
-	cfg.IPv4 = updatedAccount.Config.Interface.Addresses.V4
-	cfg.IPv6 = updatedAccount.Config.Interface.Addresses.V6
+	applyAccountToConfig(&cfg, updatedAccount)
 
 	result, err := json.Marshal(cfg)
 	if err != nil {
 		return "", fmt.Errorf("failed to serialize config: %w", err)
 	}
 	return string(result), nil
+}
+
+// generateAndEnroll creates a new EC key pair and enrolls it with the API.
+func generateAndEnroll(accountData models.AccountData) (privKeyDER []byte, updatedAccount *models.AccountData, err error) {
+	privKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, nil, fmt.Errorf("key generation failed: %w", err)
+	}
+	privKeyDER, err = x509.MarshalECPrivateKey(privKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("private key marshal failed: %w", err)
+	}
+	pubKeyPKIX, err := x509.MarshalPKIXPublicKey(&privKey.PublicKey)
+	if err != nil {
+		return nil, nil, fmt.Errorf("public key marshal failed: %w", err)
+	}
+
+	updated, apiErr, err := api.EnrollKey(accountData, pubKeyPKIX, "UsqueProxy")
+	if err != nil {
+		if apiErr != nil {
+			return nil, nil, fmt.Errorf("enrollment failed: %s", apiErr.ErrorsAsString("; "))
+		}
+		return nil, nil, fmt.Errorf("enrollment failed: %w", err)
+	}
+	return privKeyDER, &updated, nil
+}
+
+// applyAccountToConfig updates a config with peer endpoints and addresses from the API response.
+func applyAccountToConfig(cfg *config.Config, account *models.AccountData) {
+	if len(account.Config.Peers) > 0 {
+		peer := account.Config.Peers[0]
+		cfg.EndpointPubKey = peer.PublicKey
+		cfg.EndpointV4 = cleanEndpoint(peer.Endpoint.V4)
+		cfg.EndpointV6 = cleanEndpoint(peer.Endpoint.V6)
+	}
+	cfg.IPv4 = account.Config.Interface.Addresses.V4
+	cfg.IPv6 = account.Config.Interface.Addresses.V6
 }
 
 func cleanEndpoint(ep string) string {
@@ -489,21 +444,23 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 		tlsCfg.ClientSessionCache = quicSessionCache // 1-RTT session resumption (not 0-RTT)
 
-		// Adaptive keepalive: WiFi=110s, Cellular=25s, Unknown=55s
-		keepalive := 55 * time.Second
+		// Adaptive keepalive and PMTU based on network type
+		var hint string
 		if v := networkHint.Load(); v != nil {
-			switch v.(string) {
-			case "wifi":
-				keepalive = 110 * time.Second
-			case "cellular":
-				keepalive = 50 * time.Second
-			}
+			hint = v.(string)
 		}
 
-		// Adaptive PMTU: WiFi paths reliably support 1500; cellular stays conservative
+		keepalive := 55 * time.Second
+		switch hint {
+		case "wifi":
+			keepalive = 110 * time.Second
+		case "cellular":
+			keepalive = 50 * time.Second
+		}
+
 		disablePMTU := true
 		pktSize := uint16(packetSize) // 1242
-		if v := networkHint.Load(); v != nil && v.(string) == "wifi" {
+		if hint == "wifi" {
 			disablePMTU = false
 			pktSize = 1400
 		}
@@ -516,7 +473,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			DisablePathMTUDiscovery: disablePMTU,
 		}
 
-		udpConn, tr, _, ipConn, rsp, err := connectHappyEyeballs(
+		udpConn, tr, ipConn, rsp, err := connectHappyEyeballs(
 			ctx, tlsCfg, quicCfg,
 			cfg.EndpointV4, cfg.EndpointV6,
 			connectPort, cfg.connectUri(), protector,
@@ -607,7 +564,7 @@ func connectHappyEyeballs(
 	connectPort int,
 	connectUri string,
 	protector VpnProtector,
-) (*net.UDPConn, *http3.Transport, *http3.ClientConn, *connectip.Conn, *http.Response, error) {
+) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
 	const connectionAttemptDelay = 150 * time.Millisecond
 
 	// Build ordered endpoint list: IPv6 first, then IPv4.
@@ -620,21 +577,21 @@ func connectHappyEyeballs(
 	}
 
 	if len(endpoints) == 0 {
-		return nil, nil, nil, nil, nil, errors.New("no valid endpoints configured")
+		return nil, nil, nil, nil, errors.New("no valid endpoints configured")
 	}
 
 	// Single endpoint — no racing needed.
 	if len(endpoints) == 1 {
 		ep := endpoints[0]
 		log.Printf("Connecting to %s (%s)", ep.addr, ep.tag)
-		udpConn, tr, hconn, ipConn, rsp, err := connectTunnelProtected(ctx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
+		udpConn, tr, ipConn, rsp, err := connectTunnelProtected(ctx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
 		if err != nil {
 			if udpConn != nil {
 				udpConn.Close()
 			}
-			return nil, nil, nil, nil, nil, err
+			return nil, nil, nil, nil, err
 		}
-		return udpConn, tr, hconn, ipConn, rsp, nil
+		return udpConn, tr, ipConn, rsp, nil
 	}
 
 	// Dual-stack: race with staggered start.
@@ -645,8 +602,8 @@ func connectHappyEyeballs(
 
 	attempt := func(ep taggedEndpoint) {
 		log.Printf("Connecting to %s (%s)", ep.addr, ep.tag)
-		udpConn, tr, hconn, ipConn, rsp, err := connectTunnelProtected(raceCtx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
-		r := connResult{udpConn: udpConn, tr: tr, hconn: hconn, ipConn: ipConn, rsp: rsp, err: err, tag: ep.tag}
+		udpConn, tr, ipConn, rsp, err := connectTunnelProtected(raceCtx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
+		r := connResult{udpConn: udpConn, tr: tr, ipConn: ipConn, rsp: rsp, err: err, tag: ep.tag}
 		// Treat non-200 as failure for racing purposes.
 		if err == nil && rsp.StatusCode != 200 {
 			r.err = fmt.Errorf("tunnel rejected: %s", rsp.Status)
@@ -661,11 +618,12 @@ func connectHappyEyeballs(
 	timer := time.NewTimer(connectionAttemptDelay)
 	defer timer.Stop()
 
+	remaining := 0
 	select {
 	case r := <-ch:
 		if r.err == nil {
 			// First attempt won — no need to start second.
-			return r.udpConn, r.tr, r.hconn, r.ipConn, r.rsp, nil
+			return r.udpConn, r.tr, r.ipConn, r.rsp, nil
 		}
 		// First attempt failed — start fallback immediately.
 		log.Printf("%s failed: %v", r.tag, r.err)
@@ -673,22 +631,24 @@ func connectHappyEyeballs(
 			r.udpConn.Close()
 		}
 		go attempt(endpoints[1])
+		remaining = 1 // only the fallback is in flight
 	case <-timer.C:
 		// Delay expired — start second attempt in parallel.
 		go attempt(endpoints[1])
+		remaining = 2 // both attempts in flight
 	case <-ctx.Done():
-		return nil, nil, nil, nil, nil, ctx.Err()
+		return nil, nil, nil, nil, ctx.Err()
 	}
 
-	// Collect results: up to 2 attempts may be in flight.
+	// Collect results from in-flight attempts.
 	var lastErr error
-	for i := 0; i < 2; i++ {
+	for i := 0; i < remaining; i++ {
 		select {
 		case r := <-ch:
 			if r.err == nil {
 				// Winner — cancel the other attempt and return.
 				raceCancel()
-				return r.udpConn, r.tr, r.hconn, r.ipConn, r.rsp, nil
+				return r.udpConn, r.tr, r.ipConn, r.rsp, nil
 			}
 			log.Printf("%s failed: %v", r.tag, r.err)
 			if r.udpConn != nil {
@@ -696,10 +656,10 @@ func connectHappyEyeballs(
 			}
 			lastErr = r.err
 		case <-ctx.Done():
-			return nil, nil, nil, nil, nil, ctx.Err()
+			return nil, nil, nil, nil, ctx.Err()
 		}
 	}
-	return nil, nil, nil, nil, nil, lastErr
+	return nil, nil, nil, nil, lastErr
 }
 
 // connectTunnelProtected mirrors api.ConnectTunnel but protects the UDP
@@ -711,7 +671,7 @@ func connectTunnelProtected(
 	endpoint *net.UDPAddr,
 	connectUri string,
 	protector VpnProtector,
-) (*net.UDPConn, *http3.Transport, *http3.ClientConn, *connectip.Conn, *http.Response, error) {
+) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
 	// Create UDP socket
 	listenAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
 	if endpoint.IP.To4() == nil {
@@ -719,31 +679,20 @@ func connectTunnelProtected(
 	}
 	udpConn, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
-		return nil, nil, nil, nil, nil, fmt.Errorf("UDP socket: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("UDP socket: %w", err)
 	}
 
 	// Protect before QUIC handshake
-	rawConn, err := udpConn.SyscallConn()
-	if err != nil {
+	if err := protectUDPConn(udpConn, protector); err != nil {
 		udpConn.Close()
-		return nil, nil, nil, nil, nil, fmt.Errorf("raw conn: %w", err)
-	}
-	var protectErr error
-	rawConn.Control(func(fd uintptr) {
-		if !protector.ProtectFd(int(fd)) {
-			protectErr = errors.New("VPN protect() failed")
-		}
-	})
-	if protectErr != nil {
-		udpConn.Close()
-		return nil, nil, nil, nil, nil, protectErr
+		return nil, nil, nil, nil, err
 	}
 
 	// QUIC + Connect-IP (mirrors api.ConnectTunnel logic)
 	conn, err := quic.Dial(ctx, udpConn, endpoint, tlsConfig, quicConfig)
 	if err != nil {
 		udpConn.Close()
-		return nil, nil, nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
 
 	tr := &http3.Transport{
@@ -757,10 +706,11 @@ func connectTunnelProtected(
 
 	ipConn, rsp, err := connectip.Dial(ctx, hconn, template, "cf-connect-ip", headers, true)
 	if err != nil {
+		tr.Close()
 		udpConn.Close()
-		return nil, nil, nil, nil, nil, fmt.Errorf("connect-ip: %v", err)
+		return nil, nil, nil, nil, fmt.Errorf("connect-ip: %v", err)
 	}
-	return udpConn, tr, hconn, ipConn, rsp, nil
+	return udpConn, tr, ipConn, rsp, nil
 }
 
 func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor, dnsCache *tunnelDnsCache) {
@@ -775,44 +725,22 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 		pkt := buf[:n]
 		txBytes.Add(int64(n))
 
-		// Intercept DNS packets (IPv4 and IPv6) when DoH is active
-		if dns != nil {
-			if srcIP, srcPort, dstIP, query, ok := isAnyDNSPacket(pkt); ok {
+		// Intercept DNS packets (IPv4 and IPv6)
+		if srcIP, srcPort, dstIP, query, isIPv6, ok := detectDNSQuery(pkt); ok {
+			if dns != nil {
 				bufPtr := dnsQueryPool.Get().(*[]byte)
 				queryCopy := append((*bufPtr)[:0], query...)
 				pool.Put(buf)
 				dns.forwardUp(dnsRequest{
 					srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
 					query: queryCopy, writeFunc: device.WritePacket,
-					poolBuf: bufPtr,
+					isIPv6: isIPv6, poolBuf: bufPtr,
 				})
 				continue
 			}
-			if srcIP, srcPort, dstIP, query, ok := isAnyDNSv6Packet(pkt); ok {
-				bufPtr := dnsQueryPool.Get().(*[]byte)
-				queryCopy := append((*bufPtr)[:0], query...)
+			if dnsCache != nil && dnsCache.checkAndRespond(pkt, device.WritePacket) {
 				pool.Put(buf)
-				dns.forwardUp(dnsRequest{
-					srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
-					query: queryCopy, writeFunc: device.WritePacket,
-					isIPv6: true, poolBuf: bufPtr,
-				})
 				continue
-			}
-		}
-
-		// Cache-only DNS interception (non-DoH mode)
-		if dnsCache != nil {
-			if _, _, _, _, ok := isAnyDNSPacket(pkt); ok {
-				if dnsCache.checkAndRespond(pkt, device.WritePacket) {
-					pool.Put(buf)
-					continue
-				}
-			} else if _, _, _, _, ok := isAnyDNSv6Packet(pkt); ok {
-				if dnsCache.checkAndRespond(pkt, device.WritePacket) {
-					pool.Put(buf)
-					continue
-				}
 			}
 		}
 
@@ -850,8 +778,12 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetB
 }
 
 func selfSignedCert(privKey *ecdsa.PrivateKey) ([][]byte, error) {
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		return nil, err
+	}
 	der, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
-		SerialNumber: big.NewInt(0),
+		SerialNumber: serial,
 		NotBefore:    time.Now(),
 		NotAfter:     time.Now().Add(24 * time.Hour),
 	}, &x509.Certificate{}, &privKey.PublicKey, privKey)
@@ -871,6 +803,21 @@ func cleanup(ipConn *connectip.Conn, udpConn *net.UDPConn, tr *http3.Transport) 
 	if tr != nil {
 		tr.Close()
 	}
+}
+
+// protectUDPConn marks a UDP socket as protected from VPN routing.
+func protectUDPConn(conn *net.UDPConn, protector VpnProtector) error {
+	rawConn, err := conn.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("raw conn: %w", err)
+	}
+	var protectErr error
+	rawConn.Control(func(fd uintptr) {
+		if !protector.ProtectFd(int(fd)) {
+			protectErr = errors.New("VPN protect() failed")
+		}
+	})
+	return protectErr
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {
