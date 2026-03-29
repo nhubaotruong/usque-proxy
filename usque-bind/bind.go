@@ -184,6 +184,10 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	device := &FdAdapter{file: tunFile}
 
 	err := maintainTunnel(ctx, &tcfg, device, protector)
+	// Close explicitly to unregister the GC finalizer. Without this, the
+	// finalizer can close a *reused* fd number after Kotlin hands a new VPN
+	// interface to the next StartTunnel call, killing the new tunnel.
+	tunFile.Close()
 	running.Store(false)
 	close(done)
 	return err

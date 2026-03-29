@@ -32,6 +32,9 @@
 
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
+            </intent-filter>
         </activity>
 
         <service
@@ -59,9 +62,7 @@
             <meta-data
                 android:name="android.service.quicksettings.ACTIVE_TILE"
                 android:value="true" />
-            <meta-data
-                android:name="android.service.quicksettings.LONG_CLICK_COMPONENT"
-                android:value="com.nhubaotruong.usqueproxy/.MainActivity" />
+
         </service>
         <receiver
             android:name=".receiver.BootReceiver"
