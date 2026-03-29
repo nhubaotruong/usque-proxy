@@ -66,8 +66,9 @@ type tunnelConfig struct {
 	ConnectURI  string   `json:"connect_uri"`
 	DoHURL      string   `json:"doh_url"`
 	DoQURL      string   `json:"doq_url"`
-	NetworkType string   `json:"network_type"`
-	SystemDNS   []string `json:"system_dns"`
+	NetworkType    string   `json:"network_type"`
+	SystemDNS      []string `json:"system_dns"`
+	PrivateDNS     bool     `json:"private_dns_active"`
 }
 
 func (t *tunnelConfig) sni() string {
@@ -118,11 +119,16 @@ var (
 	mu          sync.Mutex
 	cancel      context.CancelFunc
 	running     atomic.Bool
+	connected   atomic.Bool  // true when MASQUE tunnel is forwarding traffic
 	done        chan struct{} // closed when maintainTunnel returns
 	reconnectCh chan struct{}
 	startTime   time.Time
+	connectedAt atomic.Int64 // unix millis when last connected (0 if not connected)
 	txBytes     atomic.Int64
 	rxBytes     atomic.Int64
+	lastError    atomic.Value // string: last connection error message
+	hasNetwork   atomic.Bool  // set by Android via SetConnectivity
+	connectCount atomic.Int64 // number of connection attempts since StartTunnel
 )
 
 // StartTunnel starts the MASQUE tunnel. Blocks until StopTunnel or error.
@@ -160,8 +166,13 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	done = make(chan struct{})
 	reconnectCh = make(chan struct{}, 1)
 	running.Store(true)
+	connected.Store(false)
 	networkTriggered.Store(false)
+	hasNetwork.Store(true)
+	lastError.Store("")
 	startTime = time.Now()
+	connectedAt.Store(0)
+	connectCount.Store(0)
 	txBytes.Store(0)
 	rxBytes.Store(0)
 	mu.Unlock()
@@ -199,6 +210,17 @@ func SetNetworkHint(hint string) {
 	networkHint.Store(hint)
 }
 
+// SetConnectivity tells the tunnel whether the device has network.
+// When false, the reconnect loop sleeps instead of hammering failed dials.
+// Call from Kotlin: true on onAvailable, false on onLost (no active network).
+func SetConnectivity(networkAvailable bool) {
+	wasConnected := hasNetwork.Swap(networkAvailable)
+	if networkAvailable && !wasConnected {
+		// Network restored — trigger reconnect to pick up the new network
+		Reconnect()
+	}
+}
+
 // Reconnect tears down the current QUIC connection but keeps the reconnect
 // loop alive so it re-establishes on the (possibly new) network.
 func Reconnect() {
@@ -223,12 +245,21 @@ func IsRunning() bool {
 func GetStats() string {
 	stats := map[string]interface{}{
 		"running":    running.Load(),
+		"connected":  connected.Load(),
 		"tx_bytes":   txBytes.Load(),
 		"rx_bytes":   rxBytes.Load(),
 		"uptime_sec": 0,
+		"has_network":    hasNetwork.Load(),
+		"connect_count":  connectCount.Load(),
+	}
+	if e, ok := lastError.Load().(string); ok && e != "" {
+		stats["last_error"] = e
 	}
 	if running.Load() {
 		stats["uptime_sec"] = int(time.Since(startTime).Seconds())
+	}
+	if t := connectedAt.Load(); t > 0 {
+		stats["connected_since_ms"] = t
 	}
 	b, _ := json.Marshal(stats)
 	return string(b)
@@ -374,7 +405,10 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 	pool := api.NewNetBuffer(mtu)
 
-	// Create DNS interceptor (DoH or System DNS) or tunnel DNS cache (fallback)
+	// Create DNS interceptor (DoH or System DNS) or tunnel DNS cache (fallback).
+	// When Android Private DNS (DoT) is active with system DNS mode, skip our
+	// system DNS interception — Android resolves DNS directly via DoT, so our
+	// interceptor would just add latency for no benefit.
 	var dns *dnsInterceptor
 	var dnsCache *tunnelDnsCache
 	if cfg.DoHURL != "" {
@@ -389,12 +423,14 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			defer dns.close()
 			log.Println("DNS interception enabled: all port 53 traffic via DoQ")
 		}
-	} else if len(cfg.SystemDNS) > 0 {
+	} else if len(cfg.SystemDNS) > 0 && !cfg.PrivateDNS {
 		dns = newSystemDnsInterceptor(ctx, cfg.SystemDNS, protector)
 		if dns != nil {
 			defer dns.close()
 			log.Printf("System DNS interception enabled: forwarding via protected sockets to %v", cfg.SystemDNS)
 		}
+	} else if len(cfg.SystemDNS) > 0 && cfg.PrivateDNS {
+		log.Println("Android Private DNS active — skipping system DNS interception, DNS handled by OS via DoT")
 	} else {
 		dnsCache = newTunnelDnsCache(512)
 		log.Println("DNS tunnel cache enabled")
@@ -425,6 +461,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		if cachedCert == nil || time.Now().After(certExpiry.Add(-certRenewBefore)) {
 			cert, err := selfSignedCert(privKey)
 			if err != nil {
+				lastError.Store(err.Error())
 				log.Printf("cert generation: %v", err)
 				sleepCtx(ctx, backoff)
 				backoff = nextBackoff(backoff, maxBackoff)
@@ -436,6 +473,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 		tlsCfg, err := api.PrepareTlsConfig(privKey, peerPubKey, cachedCert, cfg.sni())
 		if err != nil {
+			lastError.Store(err.Error())
 			log.Printf("TLS config: %v", err)
 			sleepCtx(ctx, backoff)
 			backoff = nextBackoff(backoff, maxBackoff)
@@ -473,18 +511,28 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			DisablePathMTUDiscovery: disablePMTU,
 		}
 
+		connectCount.Add(1)
 		udpConn, tr, ipConn, rsp, err := connectHappyEyeballs(
 			ctx, tlsCfg, quicCfg,
 			cfg.EndpointV4, cfg.EndpointV6,
 			connectPort, cfg.connectUri(), protector,
 		)
 		if err != nil {
+			lastError.Store(err.Error())
 			log.Printf("connect: %v", err)
-			sleepCtx(ctx, backoff)
-			backoff = nextBackoff(backoff, maxBackoff)
+			// If no network, wait for SetConnectivity(true) instead of hammering
+			if !hasNetwork.Load() {
+				log.Println("no network — waiting for connectivity")
+				waitForNetwork(ctx)
+				backoff = minBackoff
+			} else {
+				sleepCtx(ctx, backoff)
+				backoff = nextBackoff(backoff, maxBackoff)
+			}
 			continue
 		}
 		if rsp.StatusCode != 200 {
+			lastError.Store(fmt.Sprintf("tunnel rejected: %s", rsp.Status))
 			log.Printf("tunnel rejected: %s", rsp.Status)
 			cleanup(ipConn, udpConn, tr)
 			sleepCtx(ctx, backoff)
@@ -494,6 +542,9 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 
 		// Connection succeeded — reset backoff.
 		backoff = minBackoff
+		connected.Store(true)
+		connectedAt.Store(time.Now().UnixMilli())
+		lastError.Store("")
 		log.Println("Connected to MASQUE server")
 
 		errChan := make(chan error, 2)
@@ -505,8 +556,13 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		isNetworkReconnect := false
 		select {
 		case err = <-errChan:
+			connected.Store(false)
+			connectedAt.Store(0)
+			lastError.Store(err.Error())
 			log.Printf("tunnel lost: %v", err)
 		case <-reconnectCh:
+			connected.Store(false)
+			connectedAt.Store(0)
 			log.Println("reconnect requested")
 			if networkTriggered.Swap(false) {
 				isNetworkReconnect = true
@@ -516,6 +572,8 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 				backoff = minBackoff
 			}
 		case <-ctx.Done():
+			connected.Store(false)
+			connectedAt.Store(0)
 		}
 
 		cleanup(ipConn, udpConn, tr)
@@ -818,6 +876,24 @@ func protectUDPConn(conn *net.UDPConn, protector VpnProtector) error {
 		}
 	})
 	return protectErr
+}
+
+// waitForNetwork blocks until hasNetwork becomes true or ctx is cancelled.
+// Polls every 500ms — SetConnectivity(true) also triggers Reconnect() which
+// will wake the select in maintainTunnel if we're past the connection phase.
+func waitForNetwork(ctx context.Context) {
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if hasNetwork.Load() {
+				return
+			}
+		}
+	}
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {

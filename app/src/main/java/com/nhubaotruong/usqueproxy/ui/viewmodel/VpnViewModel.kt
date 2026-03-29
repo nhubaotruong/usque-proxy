@@ -42,8 +42,14 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch {
             UsqueVpnService.events.collect { event ->
                 when (event) {
+                    is UsqueVpnService.Companion.VpnServiceEvent.Connecting -> {
+                        _vpnState.value = VpnState.CONNECTING
+                    }
                     is UsqueVpnService.Companion.VpnServiceEvent.Started -> {
                         _vpnState.value = VpnState.CONNECTED
+                    }
+                    is UsqueVpnService.Companion.VpnServiceEvent.Disconnecting -> {
+                        // Keep current state — avoid UI flicker during brief disconnect
                     }
                     is UsqueVpnService.Companion.VpnServiceEvent.Stopped -> {
                         _vpnState.value = VpnState.DISCONNECTED
