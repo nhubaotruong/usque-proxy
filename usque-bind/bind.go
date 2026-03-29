@@ -579,7 +579,6 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, dnsCache) }()
 		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache) }()
 
-		isNetworkReconnect := false
 		select {
 		case err = <-errChan:
 			connected.Store(false)
@@ -591,7 +590,6 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			connectedAt.Store(0)
 			log.Println("reconnect requested")
 			if networkTriggered.Swap(false) {
-				isNetworkReconnect = true
 				backoff = 200 * time.Millisecond // micro-delay lets new network's routing stabilize
 				networkGraceAttempts = networkGraceMax
 			} else {
