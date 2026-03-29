@@ -608,8 +608,9 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			return nil
 		}
 
-		// Reset DNS connections on network change so stale sockets are discarded
-		if isNetworkReconnect && dns != nil {
+		// Always reset DNS connections on reconnect — DoH/DoQ maintain persistent
+		// connections that go stale when the tunnel dies (e.g., screen off).
+		if dns != nil {
 			dns.resetConnections()
 		}
 
