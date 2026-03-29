@@ -320,7 +320,7 @@ class UsqueVpnService : VpnService() {
         }
     }
 
-    private fun startVpn(prefs: VpnPrefs) {
+    private suspend fun startVpn(prefs: VpnPrefs) {
         val config = JSONObject(prefs.activeConfigJson)
         // SNI: use custom if set, otherwise default to ZT SNI for ZeroTrust profile
         if (prefs.customSni.isNotBlank()) {
