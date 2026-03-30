@@ -132,6 +132,11 @@ var (
 	lastError    atomic.Value // string: last connection error message
 	hasNetwork   atomic.Bool  // set by Android via SetConnectivity
 	connectCount atomic.Int64 // number of connection attempts since StartTunnel
+	// lastRxTime/lastTxTime track the most recent packet activity (Unix nanos).
+	// Used by the liveness goroutine to detect one-way stalls where the server
+	// stops forwarding (rx frozen) while the client is still sending (tx active).
+	lastRxTime atomic.Int64 // Unix nanos of last received IP packet from tunnel
+	lastTxTime atomic.Int64 // Unix nanos of last IP packet written to tunnel
 )
 
 // StartTunnel starts the MASQUE tunnel. Blocks until StopTunnel or error.
@@ -179,6 +184,8 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	connectCount.Store(0)
 	txBytes.Store(0)
 	rxBytes.Store(0)
+	lastRxTime.Store(0)
+	lastTxTime.Store(0)
 	mu.Unlock()
 
 	// Dup the fd so Go owns an independent copy. Without this, Go's GC
@@ -269,23 +276,37 @@ func IsRunning() bool {
 
 // GetStats returns JSON with tunnel statistics.
 func GetStats() string {
+	now := time.Now()
 	stats := map[string]interface{}{
-		"running":    running.Load(),
-		"connected":  connected.Load(),
-		"tx_bytes":   txBytes.Load(),
-		"rx_bytes":   rxBytes.Load(),
-		"uptime_sec": 0,
-		"has_network":    hasNetwork.Load(),
-		"connect_count":  connectCount.Load(),
+		"running":       running.Load(),
+		"connected":     connected.Load(),
+		"tx_bytes":      txBytes.Load(),
+		"rx_bytes":      rxBytes.Load(),
+		"uptime_sec":    0,
+		"has_network":   hasNetwork.Load(),
+		"connect_count": connectCount.Load(),
 	}
 	if e, ok := lastError.Load().(string); ok && e != "" {
 		stats["last_error"] = e
 	}
 	if running.Load() {
-		stats["uptime_sec"] = int(time.Since(startTime).Seconds())
+		stats["uptime_sec"] = int(now.Sub(startTime).Seconds())
 	}
 	if t := connectedAt.Load(); t > 0 {
 		stats["connected_since_ms"] = t
+	}
+	// Diagnostic fields for liveness/stall monitoring.
+	if rxNs := lastRxTime.Load(); rxNs > 0 {
+		stats["last_rx_time_ms"] = rxNs / int64(time.Millisecond)
+		if connected.Load() {
+			stats["rx_stall_sec"] = int(now.Sub(time.Unix(0, rxNs)).Seconds())
+		}
+	}
+	if txNs := lastTxTime.Load(); txNs > 0 {
+		stats["last_tx_time_ms"] = txNs / int64(time.Millisecond)
+	}
+	if v := networkHint.Load(); v != nil {
+		stats["network_hint"] = v.(string)
 	}
 	b, _ := json.Marshal(stats)
 	return string(b)
@@ -571,13 +592,22 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		connected.Store(true)
 		connectedAt.Store(time.Now().UnixMilli())
 		lastError.Store("")
+		// Seed liveness timestamps so the check doesn't immediately fire.
+		now := time.Now().UnixNano()
+		lastRxTime.Store(now)
+		lastTxTime.Store(now)
 		log.Println("Connected to MASQUE server")
+
+		// Per-connection context: cancelled when this connection ends, which stops
+		// the liveness goroutine immediately without waiting for its next tick.
+		connCtx, connCancel := context.WithCancel(ctx)
 
 		errChan := make(chan error, 2)
 		var wg sync.WaitGroup
-		wg.Add(2)
+		wg.Add(3)
 		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, dnsCache) }()
 		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache) }()
+		go func() { defer wg.Done(); livenessCheck(connCtx) }()
 
 		select {
 		case err = <-errChan:
@@ -600,6 +630,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			connectedAt.Store(0)
 		}
 
+		connCancel() // stop liveness goroutine immediately
 		cleanup(ipConn, udpConn, tr)
 		wg.Wait() // wait for forwarding goroutines to exit before reconnecting
 		if ctx.Err() != nil {
@@ -843,6 +874,7 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 			errChan <- err
 			return
 		}
+		lastTxTime.Store(time.Now().UnixNano())
 		if len(icmp) > 0 {
 			_ = device.WritePacket(icmp)
 		}
@@ -859,6 +891,7 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, _ *api.NetBuff
 			errChan <- err
 			return
 		}
+		lastRxTime.Store(time.Now().UnixNano())
 		rxBytes.Add(int64(n))
 		if dnsCache != nil {
 			dnsCache.cacheResponse(buf[:n])
@@ -866,6 +899,42 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, _ *api.NetBuff
 		if err := device.WritePacket(buf[:n]); err != nil {
 			errChan <- err
 			return
+		}
+	}
+}
+
+// livenessCheck periodically detects one-way tunnel stalls where the server
+// has silently stopped forwarding (rx frozen) while the client is still
+// sending traffic (tx active). This covers the case where the Cloudflare
+// MASQUE session expires server-side but the QUIC connection remains alive
+// (keepalives keep the transport up, so forwardDown never gets an error).
+//
+// Stall condition: no rx packet for >30s AND tx packet within last 30s.
+// Idle connections (both rx and tx silent) do NOT trigger a reconnect.
+//
+// Exits immediately when ctx is cancelled (connection ended or reconnecting).
+func livenessCheck(ctx context.Context) {
+	const (
+		rxStallTimeout = 30 * time.Second
+		txActiveWindow = 30 * time.Second
+		checkInterval  = 10 * time.Second
+	)
+	ticker := time.NewTicker(checkInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			now := time.Now()
+			rxAge := now.Sub(time.Unix(0, lastRxTime.Load()))
+			txAge := now.Sub(time.Unix(0, lastTxTime.Load()))
+			if rxAge > rxStallTimeout && txAge < txActiveWindow {
+				log.Printf("liveness: rx stall detected (no rx for %.0fs, last tx %.0fs ago) — triggering reconnect",
+					rxAge.Seconds(), txAge.Seconds())
+				Reconnect()
+				return // one reconnect signal is enough; exit so we don't spam
+			}
 		}
 	}
 }
