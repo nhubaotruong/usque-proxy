@@ -517,7 +517,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		keepalive := 55 * time.Second
 		switch hint {
 		case "wifi":
-			keepalive = 110 * time.Second
+			keepalive = 60 * time.Second
 		case "cellular":
 			keepalive = 50 * time.Second
 		}
@@ -533,7 +533,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			EnableDatagrams:         true,
 			InitialPacketSize:       pktSize,
 			KeepAlivePeriod:         keepalive,
-			MaxIdleTimeout:          300 * time.Second, // 3+ keepalive rounds before timeout; CF allows up to 300s
+			MaxIdleTimeout:          90 * time.Second, // 1.5x keepalive — detect dead connections quickly
 			DisablePathMTUDiscovery: disablePMTU,
 		}
 

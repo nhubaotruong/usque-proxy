@@ -142,19 +142,34 @@ class UsqueVpnService : VpnService() {
     private val idleModeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
+                Intent.ACTION_SCREEN_ON -> {
+                    // Screen turned on — reconnect immediately without debounce.
+                    // Do not check isDeviceIdle: Doze exit fires separately and may lag
+                    // behind screen-on, so the idle flag could still be true here.
+                    if (isRunning) {
+                        Log.i(TAG, "Screen on, triggering immediate tunnel reconnect")
+                        reconnectWakeLock.acquire(30_000L)
+                        try {
+                            Usquebind.reconnect()
+                        } finally {
+                            if (reconnectWakeLock.isHeld) reconnectWakeLock.release()
+                        }
+                    }
+                }
                 PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED -> {
                     val idle = powerManager.isDeviceIdleMode
-                    val wasIdle = isDeviceIdle
                     isDeviceIdle = idle
-                    if (wasIdle && !idle && isRunning) {
-                        Log.i(TAG, "Exiting Doze mode, triggering reconnect")
-                        restartTunnel()
+                    if (!idle) {
+                        Log.i(TAG, "Exiting Doze mode")
+                        // Screen-on already fired a reconnect; this is a no-op in that case.
+                        // Handles the edge case where Doze exits without a screen-on event
+                        // (e.g., incoming call, alarm).
+                        if (isRunning) restartTunnel()
                     }
                 }
                 PowerManager.ACTION_POWER_SAVE_MODE_CHANGED -> {
                     val saving = powerManager.isPowerSaveMode
                     Log.i(TAG, "Power Save Mode: $saving")
-                    // In power save mode, increase reconnect debounce to reduce wake-ups
                     isPowerSaveMode = saving
                 }
             }
@@ -245,6 +260,7 @@ class UsqueVpnService : VpnService() {
         registerReceiver(
             idleModeReceiver,
             IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
                 addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
                 addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
             },
