@@ -18,6 +18,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
+import android.os.SystemClock
 import android.util.Log
 import com.nhubaotruong.usqueproxy.MainActivity
 import com.nhubaotruong.usqueproxy.R
@@ -127,6 +128,8 @@ class UsqueVpnService : VpnService() {
     private var isManagedShutdown = false // true during stopVpnInternal, prevents self-stop in tunnelJob finally
     @Volatile
     private var isPowerSaveMode = false
+    @Volatile
+    private var screenOffAt: Long = 0L
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val lifecycleMutex = Mutex()
@@ -142,12 +145,16 @@ class UsqueVpnService : VpnService() {
     private val idleModeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
+                Intent.ACTION_SCREEN_OFF -> {
+                    screenOffAt = SystemClock.elapsedRealtime()
+                }
                 Intent.ACTION_SCREEN_ON -> {
-                    // Screen turned on — reconnect immediately without debounce.
-                    // Do not check isDeviceIdle: Doze exit fires separately and may lag
-                    // behind screen-on, so the idle flag could still be true here.
-                    if (isRunning) {
-                        Log.i(TAG, "Screen on, triggering immediate tunnel reconnect")
+                    // Only reconnect if screen was off long enough for the tunnel to
+                    // have gone stale (≥60s). Short unlocks (pocket check, notification
+                    // glance) don't need a reconnect and would just waste battery.
+                    val offDuration = SystemClock.elapsedRealtime() - screenOffAt
+                    if (isRunning && screenOffAt > 0L && offDuration >= 60_000L) {
+                        Log.i(TAG, "Screen on after ${offDuration / 1000}s off, reconnecting tunnel")
                         reconnectWakeLock.acquire(30_000L)
                         try {
                             Usquebind.reconnect()
@@ -260,6 +267,7 @@ class UsqueVpnService : VpnService() {
         registerReceiver(
             idleModeReceiver,
             IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_OFF)
                 addAction(Intent.ACTION_SCREEN_ON)
                 addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
                 addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
