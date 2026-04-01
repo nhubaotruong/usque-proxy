@@ -7,11 +7,11 @@
 
 ### Tunnel Core
 
-- [ ] **TUNL-01**: Forwarding goroutines detect `connectip.CloseError` and trigger immediate reconnection
-- [ ] **TUNL-02**: Reconnection uses constant 1-second delay instead of exponential backoff with jitter
-- [ ] **TUNL-03**: Each reconnect cycle cleanly tears down all resources (ipConn, udpConn, HTTP/3 transport) before retry
-- [ ] **TUNL-04**: Tunnel loop retries infinitely with no maximum attempt limit
-- [ ] **TUNL-05**: Non-fatal forwarding errors (individual packet write/read failures) are logged but don't trigger reconnection
+- [x] **TUNL-01**: Forwarding goroutines detect `connectip.CloseError` and trigger immediate reconnection
+- [x] **TUNL-02**: Reconnection uses constant 1-second delay instead of exponential backoff with jitter
+- [x] **TUNL-03**: Each reconnect cycle cleanly tears down all resources (ipConn, udpConn, HTTP/3 transport) before retry
+- [x] **TUNL-04**: Tunnel loop retries infinitely with no maximum attempt limit
+- [x] **TUNL-05**: Non-fatal forwarding errors (individual packet write/read failures) are logged but don't trigger reconnection
 
 ### Complexity Removal
 
@@ -31,7 +31,7 @@
 - [ ] **CMPT-02**: `getStats()` still returns connection status, rx/tx bytes for UI display
 - [ ] **CMPT-03**: Network callbacks (`setConnectivity`, network change → reconnect) continue working
 - [ ] **CMPT-04**: Doze mode handling (screen on/off reconnect, idle mode receiver) continues working
-- [ ] **CMPT-05**: QUIC keepalive period set to 30 seconds (matching usque-android's proven value)
+- [x] **CMPT-05**: QUIC keepalive period set to 30 seconds (matching usque-android's proven value)
 
 ## v2 Requirements
 
@@ -55,11 +55,11 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| TUNL-01 | Phase 1 | Pending |
-| TUNL-02 | Phase 1 | Pending |
-| TUNL-03 | Phase 1 | Pending |
-| TUNL-04 | Phase 1 | Pending |
-| TUNL-05 | Phase 1 | Pending |
+| TUNL-01 | Phase 1 | Complete |
+| TUNL-02 | Phase 1 | Complete |
+| TUNL-03 | Phase 1 | Complete |
+| TUNL-04 | Phase 1 | Complete |
+| TUNL-05 | Phase 1 | Complete |
 | RMVL-01 | Phase 2 | Pending |
 | RMVL-02 | Phase 2 | Pending |
 | RMVL-03 | Phase 2 | Pending |
@@ -73,7 +73,7 @@
 | CMPT-02 | Phase 3 | Pending |
 | CMPT-03 | Phase 3 | Pending |
 | CMPT-04 | Phase 3 | Pending |
-| CMPT-05 | Phase 1 | Pending |
+| CMPT-05 | Phase 1 | Complete |
 
 **Coverage:**
 - v1 requirements: 19 total

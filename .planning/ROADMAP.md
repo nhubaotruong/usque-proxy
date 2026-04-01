@@ -30,7 +30,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 **Plans:** 2 plans
 
 Plans:
-- [ ] 01-01-PLAN.md — Rewrite forwarding loops with CloseError classification and simplify reconnect to constant 1s delay
+- [x] 01-01-PLAN.md — Rewrite forwarding loops with CloseError classification and simplify reconnect to constant 1s delay
 - [ ] 01-02-PLAN.md — Remove obsolete stats fields, dead code (nextBackoff, livenessCheck), and clean up Kotlin side
 
 ### Phase 2: Complexity Removal
