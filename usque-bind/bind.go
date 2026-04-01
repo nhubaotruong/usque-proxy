@@ -913,13 +913,23 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 		icmp, err := ipConn.WritePacket(pkt)
 		pool.Put(buf)
 		if err != nil {
-			errChan <- err
-			return
+			if errors.As(err, new(*connectip.CloseError)) {
+				errChan <- fmt.Errorf("connection closed while writing to IP connection: %v", err)
+				return
+			}
+			log.Printf("Error writing to IP connection: %v, continuing...", err)
+			continue
 		}
 		lastTxTime.Store(time.Now().UnixNano())
 		txPackets.Add(1)
 		if len(icmp) > 0 {
-			_ = device.WritePacket(icmp)
+			if err := device.WritePacket(icmp); err != nil {
+				if errors.As(err, new(*connectip.CloseError)) {
+					errChan <- fmt.Errorf("connection closed while writing ICMP to TUN device: %v", err)
+					return
+				}
+				log.Printf("Error writing ICMP to TUN device: %v, continuing...", err)
+			}
 		}
 	}
 }
@@ -931,8 +941,12 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, _ *api.NetBuff
 	for {
 		n, err := ipConn.ReadPacket(buf, true)
 		if err != nil {
-			errChan <- err
-			return
+			if errors.As(err, new(*connectip.CloseError)) {
+				errChan <- fmt.Errorf("connection closed while reading from IP connection: %v", err)
+				return
+			}
+			log.Printf("Error reading from IP connection: %v, continuing...", err)
+			continue
 		}
 		lastRxTime.Store(time.Now().UnixNano())
 		rxBytes.Add(int64(n))
@@ -941,7 +955,7 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, _ *api.NetBuff
 			dnsCache.cacheResponse(buf[:n])
 		}
 		if err := device.WritePacket(buf[:n]); err != nil {
-			errChan <- err
+			errChan <- fmt.Errorf("failed to write to TUN device: %v", err)
 			return
 		}
 	}
