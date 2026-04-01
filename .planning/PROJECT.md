@@ -33,7 +33,7 @@ VPN tunnel connections must stay reliably alive for hours/days without silent de
 
 ### Active
 
-- [ ] Revert all Go and Kotlin code to v1.27 baseline
+- [x] Revert all Go and Kotlin code to v1.27 baseline — Phase 1
 - [ ] Port CloseError detection in forwardUp/forwardDown from usque-android
 - [ ] Port constant 1s reconnect delay (replace exponential backoff)
 
@@ -93,4 +93,4 @@ This document evolves at phase transitions and milestone boundaries.
 4. Update Context with current state
 
 ---
-*Last updated: 2026-04-01 — Milestone v1.1 started*
+*Last updated: 2026-04-01 — Phase 1 complete (v1.27 revert)*
