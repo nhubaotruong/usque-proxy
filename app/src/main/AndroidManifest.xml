@@ -9,7 +9,6 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
-    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES"
         tools:ignore="QueryAllPackagesPermission" />
 
@@ -32,9 +31,6 @@
                 <action android:name="android.intent.action.MAIN" />
 
                 <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
-            <intent-filter>
-                <action android:name="android.service.quicksettings.action.QS_TILE_PREFERENCES" />
             </intent-filter>
         </activity>
 
@@ -63,7 +59,9 @@
             <meta-data
                 android:name="android.service.quicksettings.ACTIVE_TILE"
                 android:value="true" />
-
+            <meta-data
+                android:name="android.service.quicksettings.LONG_CLICK_COMPONENT"
+                android:value="com.nhubaotruong.usqueproxy/.MainActivity" />
         </service>
         <receiver
             android:name=".receiver.BootReceiver"

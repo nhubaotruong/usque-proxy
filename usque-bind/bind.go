@@ -15,13 +15,12 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-
+	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"os"
 	"strings"
 	"sync"
-	"syscall"
 	"sync/atomic"
 	"time"
 
@@ -39,7 +38,6 @@ const (
 	ZeroTrustSNI  = "zt-masque.cloudflareclient.com"
 	defaultURI    = "https://cloudflareaccess.com"
 	defaultLocale = "en_US"
-	tunnelMTU     = 1280 // must match mtu constant in maintainTunnel
 )
 
 // quicSessionCache enables TLS session resumption across QUIC reconnects (1-RTT, not 0-RTT).
@@ -68,6 +66,7 @@ type tunnelConfig struct {
 	ConnectURI  string   `json:"connect_uri"`
 	DoHURL      string   `json:"doh_url"`
 	DoQURL      string   `json:"doq_url"`
+	NetworkType    string   `json:"network_type"`
 	SystemDNS      []string `json:"system_dns"`
 	PrivateDNS     bool     `json:"private_dns_active"`
 }
@@ -121,9 +120,8 @@ var (
 	cancel      context.CancelFunc
 	running     atomic.Bool
 	connected   atomic.Bool  // true when MASQUE tunnel is forwarding traffic
-	done           chan struct{} // closed when maintainTunnel returns
-	reconnectCh    chan struct{}
-	connectivityCh chan struct{} // signalled by SetConnectivity(true) to wake waitForNetwork
+	done        chan struct{} // closed when maintainTunnel returns
+	reconnectCh chan struct{}
 	startTime   time.Time
 	connectedAt atomic.Int64 // unix millis when last connected (0 if not connected)
 	txBytes     atomic.Int64
@@ -131,13 +129,6 @@ var (
 	lastError    atomic.Value // string: last connection error message
 	hasNetwork   atomic.Bool  // set by Android via SetConnectivity
 	connectCount atomic.Int64 // number of connection attempts since StartTunnel
-	// lastRxTime/lastTxTime track the most recent packet activity (Unix nanos).
-	// Used by the liveness goroutine to detect one-way stalls where the server
-	// stops forwarding (rx frozen) while the client is still sending (tx active).
-	lastRxTime atomic.Int64 // Unix nanos of last received IP packet from tunnel
-	lastTxTime atomic.Int64 // Unix nanos of last IP packet written to tunnel
-
-
 )
 
 // StartTunnel starts the MASQUE tunnel. Blocks until StopTunnel or error.
@@ -174,7 +165,6 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	cancel = c
 	done = make(chan struct{})
 	reconnectCh = make(chan struct{}, 1)
-	connectivityCh = make(chan struct{}, 1)
 	running.Store(true)
 	connected.Store(false)
 	networkTriggered.Store(false)
@@ -185,27 +175,12 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	connectCount.Store(0)
 	txBytes.Store(0)
 	rxBytes.Store(0)
-	lastRxTime.Store(0)
-	lastTxTime.Store(0)
 	mu.Unlock()
 
-	// Dup the fd so Go owns an independent copy. Without this, Go's GC
-	// finalizer can close the *original* fd after Kotlin hands it to a new
-	// VPN interface (fd number reuse), killing the new tunnel on reconnect.
-	// With dup, Go closes its copy and Kotlin closes the original — no race.
-	dupFd, dupErr := syscall.Dup(tunFd)
-	if dupErr != nil {
-		mu.Lock()
-		running.Store(false)
-		close(done)
-		mu.Unlock()
-		return fmt.Errorf("dup tun fd: %w", dupErr)
-	}
-	tunFile := os.NewFile(uintptr(dupFd), "tun")
+	tunFile := os.NewFile(uintptr(tunFd), "tun")
 	device := &FdAdapter{file: tunFile}
 
 	err := maintainTunnel(ctx, &tcfg, device, protector)
-	tunFile.Close() // closes Go's dup'd fd, not Kotlin's original
 	running.Store(false)
 	close(done)
 	return err
@@ -225,22 +200,23 @@ func StopTunnel() {
 // caused by a network change, so maintainTunnel can skip the initial backoff.
 var networkTriggered atomic.Bool
 
+// networkHint stores the current network type ("wifi", "cellular", or "")
+// for adaptive keepalive intervals. Updated from Kotlin via SetNetworkHint.
+var networkHint atomic.Value
+
+// SetNetworkHint updates the network type hint for adaptive keepalive.
+// Call from Kotlin on network change: "wifi", "cellular", or "" (unknown).
+func SetNetworkHint(hint string) {
+	networkHint.Store(hint)
+}
+
 // SetConnectivity tells the tunnel whether the device has network.
 // When false, the reconnect loop sleeps instead of hammering failed dials.
 // Call from Kotlin: true on onAvailable, false on onLost (no active network).
 func SetConnectivity(networkAvailable bool) {
 	wasConnected := hasNetwork.Swap(networkAvailable)
 	if networkAvailable && !wasConnected {
-		// Network restored — wake waitForNetwork (if blocked) and trigger reconnect.
-		mu.Lock()
-		ch := connectivityCh
-		mu.Unlock()
-		if ch != nil {
-			select {
-			case ch <- struct{}{}:
-			default:
-			}
-		}
+		// Network restored — trigger reconnect to pick up the new network
 		Reconnect()
 	}
 }
@@ -265,68 +241,26 @@ func IsRunning() bool {
 	return running.Load()
 }
 
-// Keepalive probes the current tunnel connection without tearing it down.
-// Returns true if the tunnel appears alive, false if the session has likely
-// expired (triggers Reconnect automatically in that case).
-//
-// Called from Kotlin on periodic wake-ups (ScheduledExecutor or AlarmManager)
-// to detect sessions killed by Android Doze blocking UDP keepalives.
-//
-// Detection logic: if both rx and tx have been silent for longer than the
-// cellular idle timeout (120s), the QUIC session is likely dead server-side.
-// Idle connections (no apps sending traffic) have the same signature but also
-// have no tx — the 125s threshold is a conservative proxy for "Doze killed it."
-func Keepalive() bool {
-	if !running.Load() {
-		return false
-	}
-	if !connected.Load() {
-		// Tunnel is running but not connected — already in reconnect loop.
-		return false
-	}
-
-	rxNs := lastRxTime.Load()
-	txNs := lastTxTime.Load()
-	if rxNs > 0 && txNs > 0 {
-		rxAge := time.Since(time.Unix(0, rxNs))
-		txAge := time.Since(time.Unix(0, txNs))
-		// Threshold slightly above cellular MaxIdleTimeout (120s) so we reconnect
-		// before the server closes the session on its end.
-		const idleThreshold = 125 * time.Second
-		if rxAge > idleThreshold && txAge > idleThreshold {
-			log.Printf("keepalive: session idle for %.0fs/%.0fs (rx/tx) > %.0fs — reconnecting",
-				rxAge.Seconds(), txAge.Seconds(), idleThreshold.Seconds())
-			Reconnect()
-			return false
-		}
-	}
-	return true
-}
-
 // GetStats returns JSON with tunnel statistics.
 func GetStats() string {
-	now := time.Now()
 	stats := map[string]interface{}{
-		"running":       running.Load(),
-		"connected":     connected.Load(),
-		"tx_bytes":      txBytes.Load(),
-		"rx_bytes":      rxBytes.Load(),
-		"uptime_sec":    0,
-		"has_network":   hasNetwork.Load(),
-		"connect_count": connectCount.Load(),
+		"running":    running.Load(),
+		"connected":  connected.Load(),
+		"tx_bytes":   txBytes.Load(),
+		"rx_bytes":   rxBytes.Load(),
+		"uptime_sec": 0,
+		"has_network":    hasNetwork.Load(),
+		"connect_count":  connectCount.Load(),
 	}
 	if e, ok := lastError.Load().(string); ok && e != "" {
 		stats["last_error"] = e
 	}
 	if running.Load() {
-		stats["uptime_sec"] = int(now.Sub(startTime).Seconds())
+		stats["uptime_sec"] = int(time.Since(startTime).Seconds())
 	}
 	if t := connectedAt.Load(); t > 0 {
 		stats["connected_since_ms"] = t
 	}
-	// Diagnostic fields for liveness/stall monitoring.
-
-
 	b, _ := json.Marshal(stats)
 	return string(b)
 }
@@ -453,9 +387,11 @@ func cleanEndpoint(ep string) string {
 func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDevice, protector VpnProtector) error {
 	const (
 		mtu             = 1280
+		packetSize      = 1242
 		connectPort     = 443
-		certRenewBefore = 1 * time.Hour
-		reconnectDelay  = 1 * time.Second
+		minBackoff      = 1 * time.Second
+		maxBackoff      = 60 * time.Second
+		certRenewBefore = 1 * time.Hour // renew cert 1h before expiry
 	)
 
 	privKey, err := cfg.GetEcPrivateKey()
@@ -504,6 +440,16 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	var cachedCert [][]byte
 	var certExpiry time.Time
 
+	const networkGraceMax = 3 // attempts at minBackoff after network change before escalating
+
+	// Seed network hint from config; Kotlin will update dynamically via SetNetworkHint.
+	if cfg.NetworkType != "" {
+		networkHint.Store(cfg.NetworkType)
+	}
+
+	backoff := minBackoff
+	networkGraceAttempts := 0
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -517,7 +463,8 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			if err != nil {
 				lastError.Store(err.Error())
 				log.Printf("cert generation: %v", err)
-				sleepCtxReconnectable(ctx, reconnectDelay, reconnectCh)
+				sleepCtx(ctx, backoff)
+				backoff = nextBackoff(backoff, maxBackoff)
 				continue
 			}
 			cachedCert = cert
@@ -528,18 +475,40 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		if err != nil {
 			lastError.Store(err.Error())
 			log.Printf("TLS config: %v", err)
-			sleepCtxReconnectable(ctx, reconnectDelay, reconnectCh)
+			sleepCtx(ctx, backoff)
+			backoff = nextBackoff(backoff, maxBackoff)
 			continue
 		}
 
 		tlsCfg.ClientSessionCache = quicSessionCache // 1-RTT session resumption (not 0-RTT)
 
+		// Adaptive keepalive and PMTU based on network type
+		var hint string
+		if v := networkHint.Load(); v != nil {
+			hint = v.(string)
+		}
+
+		keepalive := 55 * time.Second
+		switch hint {
+		case "wifi":
+			keepalive = 110 * time.Second
+		case "cellular":
+			keepalive = 50 * time.Second
+		}
+
+		disablePMTU := true
+		pktSize := uint16(packetSize) // 1242
+		if hint == "wifi" {
+			disablePMTU = false
+			pktSize = 1400
+		}
+
 		quicCfg := &quic.Config{
 			EnableDatagrams:         true,
-			InitialPacketSize:       1280,
-			KeepAlivePeriod:         30 * time.Second,
-			MaxIdleTimeout:          120 * time.Second,
-			DisablePathMTUDiscovery: true,
+			InitialPacketSize:       pktSize,
+			KeepAlivePeriod:         keepalive,
+			MaxIdleTimeout:          300 * time.Second, // 3+ keepalive rounds before timeout; CF allows up to 300s
+			DisablePathMTUDiscovery: disablePMTU,
 		}
 
 		connectCount.Add(1)
@@ -553,10 +522,12 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			log.Printf("connect: %v", err)
 			// If no network, wait for SetConnectivity(true) instead of hammering
 			if !hasNetwork.Load() {
-				log.Println("no network -- waiting for connectivity")
+				log.Println("no network — waiting for connectivity")
 				waitForNetwork(ctx)
+				backoff = minBackoff
 			} else {
-				sleepCtxReconnectable(ctx, reconnectDelay, reconnectCh)
+				sleepCtx(ctx, backoff)
+				backoff = nextBackoff(backoff, maxBackoff)
 			}
 			continue
 		}
@@ -564,25 +535,17 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			lastError.Store(fmt.Sprintf("tunnel rejected: %s", rsp.Status))
 			log.Printf("tunnel rejected: %s", rsp.Status)
 			cleanup(ipConn, udpConn, tr)
-			sleepCtxReconnectable(ctx, reconnectDelay, reconnectCh)
+			sleepCtx(ctx, backoff)
+			backoff = nextBackoff(backoff, maxBackoff)
 			continue
 		}
 
+		// Connection succeeded — reset backoff.
+		backoff = minBackoff
 		connected.Store(true)
 		connectedAt.Store(time.Now().UnixMilli())
 		lastError.Store("")
-		// Seed liveness timestamps so the check doesn't immediately fire.
-		now := time.Now().UnixNano()
-		lastRxTime.Store(now)
-		lastTxTime.Store(now)
 		log.Println("Connected to MASQUE server")
-
-		// Drain any reconnect signal accumulated during retry loop so it doesn't
-		// immediately disconnect the freshly established connection.
-		select {
-		case <-reconnectCh:
-		default:
-		}
 
 		errChan := make(chan error, 2)
 		var wg sync.WaitGroup
@@ -590,6 +553,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, dnsCache) }()
 		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache) }()
 
+		isNetworkReconnect := false
 		select {
 		case err = <-errChan:
 			connected.Store(false)
@@ -600,26 +564,51 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			connected.Store(false)
 			connectedAt.Store(0)
 			log.Println("reconnect requested")
+			if networkTriggered.Swap(false) {
+				isNetworkReconnect = true
+				backoff = 200 * time.Millisecond // micro-delay lets new network's routing stabilize
+				networkGraceAttempts = networkGraceMax
+			} else {
+				backoff = minBackoff
+			}
 		case <-ctx.Done():
 			connected.Store(false)
 			connectedAt.Store(0)
 		}
 
 		cleanup(ipConn, udpConn, tr)
-		wg.Wait()
+		wg.Wait() // wait for forwarding goroutines to exit before reconnecting
 		if ctx.Err() != nil {
 			return nil
 		}
-		if dns != nil {
+
+		// Reset DNS connections on network change so stale sockets are discarded
+		if isNetworkReconnect && dns != nil {
 			dns.resetConnections()
 		}
-		// Network-triggered reconnect gets 200ms for routing stabilization (D-06)
-		if networkTriggered.Swap(false) {
-			sleepCtxReconnectable(ctx, 200*time.Millisecond, reconnectCh)
+
+		if backoff > 0 {
+			sleepCtx(ctx, backoff)
+		}
+		if networkGraceAttempts > 0 {
+			networkGraceAttempts--
+			backoff = minBackoff // hold at minBackoff during grace period
 		} else {
-			sleepCtxReconnectable(ctx, reconnectDelay, reconnectCh)
+			backoff = nextBackoff(backoff, maxBackoff)
 		}
 	}
+}
+
+// nextBackoff doubles the current backoff, capped at max, with 0–25% random jitter.
+func nextBackoff(current, max time.Duration) time.Duration {
+	next := current * 2
+	if next > max {
+		next = max
+	}
+	if quarter := int64(next) / 4; quarter > 0 {
+		next += time.Duration(mrand.Int64N(quarter))
+	}
+	return next
 }
 
 // connectHappyEyeballs implements Happy Eyeballs v3 (RFC 8305 / draft-ietf-happy-happyeyeballs-v3)
@@ -794,14 +783,6 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 		pkt := buf[:n]
 		txBytes.Add(int64(n))
 
-		// Fast path: cheap version+protocol+port check before the full IP-extracting parse.
-		// ~95% of packets are not DNS — this avoids all allocations for that majority.
-		if dns != nil || dnsCache != nil {
-			if _, isDNS := isDNSPacketFast(pkt); !isDNS {
-				goto sendPacket
-			}
-		}
-
 		// Intercept DNS packets (IPv4 and IPv6)
 		if srcIP, srcPort, dstIP, query, isIPv6, ok := detectDNSQuery(pkt); ok {
 			if dns != nil {
@@ -821,52 +802,34 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 			}
 		}
 
-	sendPacket:
 		// Send via Connect-IP datagrams (UDP, ICMP, TCP, etc.)
 		icmp, err := ipConn.WritePacket(pkt)
 		pool.Put(buf)
 		if err != nil {
-			if errors.As(err, new(*connectip.CloseError)) {
-				errChan <- fmt.Errorf("connection closed while writing to IP connection: %v", err)
-				return
-			}
-			log.Printf("Error writing to IP connection: %v, continuing...", err)
-			continue
+			errChan <- err
+			return
 		}
-		lastTxTime.Store(time.Now().UnixNano())
 		if len(icmp) > 0 {
-			if err := device.WritePacket(icmp); err != nil {
-				if errors.As(err, new(*connectip.CloseError)) {
-					errChan <- fmt.Errorf("connection closed while writing ICMP to TUN device: %v", err)
-					return
-				}
-				log.Printf("Error writing ICMP to TUN device: %v, continuing...", err)
-			}
+			_ = device.WritePacket(icmp)
 		}
 	}
 }
 
-func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, _ *api.NetBuffer, errChan chan<- error, dnsCache *tunnelDnsCache) {
-	// Allocate directly instead of using the pool: this buffer lives for the
-	// entire connection lifetime, so pool Get/Put mutex overhead is wasted.
-	buf := make([]byte, tunnelMTU)
+func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dnsCache *tunnelDnsCache) {
+	buf := pool.Get()
+	defer pool.Put(buf)
 	for {
 		n, err := ipConn.ReadPacket(buf, true)
 		if err != nil {
-			if errors.As(err, new(*connectip.CloseError)) {
-				errChan <- fmt.Errorf("connection closed while reading from IP connection: %v", err)
-				return
-			}
-			log.Printf("Error reading from IP connection: %v, continuing...", err)
-			continue
+			errChan <- err
+			return
 		}
-		lastRxTime.Store(time.Now().UnixNano())
 		rxBytes.Add(int64(n))
 		if dnsCache != nil {
 			dnsCache.cacheResponse(buf[:n])
 		}
 		if err := device.WritePacket(buf[:n]); err != nil {
-			errChan <- fmt.Errorf("failed to write to TUN device: %v", err)
+			errChan <- err
 			return
 		}
 	}
@@ -915,54 +878,22 @@ func protectUDPConn(conn *net.UDPConn, protector VpnProtector) error {
 	return protectErr
 }
 
-// waitForNetwork blocks until SetConnectivity(true) is called or ctx is cancelled.
-// Uses a channel signal instead of polling — zero CPU wakeups while waiting.
+// waitForNetwork blocks until hasNetwork becomes true or ctx is cancelled.
+// Polls every 500ms — SetConnectivity(true) also triggers Reconnect() which
+// will wake the select in maintainTunnel if we're past the connection phase.
 func waitForNetwork(ctx context.Context) {
-	if hasNetwork.Load() {
-		return // already have network, no need to block
-	}
-	mu.Lock()
-	ch := connectivityCh
-	mu.Unlock()
-	if ch == nil {
-		return
-	}
-	select {
-	case <-ctx.Done():
-	case <-ch:
-	}
-}
-
-// isDNSPacketFast is a zero-allocation check for whether pkt is a UDP packet to port 53.
-// Checks only version nibble, protocol byte, and destination port — no IP extraction.
-// Call this before detectDNSQuery to skip allocations for the ~95% of non-DNS packets.
-// Returns (isIPv6 bool, ok bool).
-func isDNSPacketFast(pkt []byte) (isIPv6 bool, ok bool) {
-	if len(pkt) < 8 {
-		return false, false
-	}
-	version := pkt[0] >> 4
-	switch version {
-	case 4: // IPv4
-		if len(pkt) < 28 || pkt[9] != 17 { // 17 = UDP
-			return false, false
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if hasNetwork.Load() {
+				return
+			}
 		}
-		ihl := int(pkt[0]&0x0f) * 4
-		if len(pkt) < ihl+4 {
-			return false, false
-		}
-		// Destination port at ihl+2
-		dstPort := uint16(pkt[ihl+2])<<8 | uint16(pkt[ihl+3])
-		return false, dstPort == 53
-	case 6: // IPv6
-		if len(pkt) < 48 || pkt[6] != 17 { // next header must be UDP directly
-			return false, false
-		}
-		// UDP header at offset 40; destination port at 42
-		dstPort := uint16(pkt[42])<<8 | uint16(pkt[43])
-		return true, dstPort == 53
 	}
-	return false, false
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) {
@@ -971,20 +902,5 @@ func sleepCtx(ctx context.Context, d time.Duration) {
 	select {
 	case <-ctx.Done():
 	case <-timer.C:
-	}
-}
-
-// sleepCtxReconnectable is like sleepCtx but also wakes on a reconnect signal.
-// Returns true if woken by rch (caller should reset backoff), false otherwise.
-func sleepCtxReconnectable(ctx context.Context, d time.Duration, rch <-chan struct{}) bool {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return false
-	case <-rch:
-		return true
 	}
 }

@@ -30,12 +30,6 @@ enum class VpnState { DISCONNECTED, CONNECTING, CONNECTED }
 data class TunnelStats(
     val txBytes: Long = 0,
     val rxBytes: Long = 0,
-    val connected: Boolean = false,
-    val hasNetwork: Boolean = true,
-    val connectCount: Long = 0,
-    val lastError: String = "",
-    val uptimeSec: Int = 0,
-    val connectedSinceMs: Long = 0,
 )
 
 class VpnViewModel(application: Application) : AndroidViewModel(application) {
@@ -120,19 +114,12 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
         val json = withContext(Dispatchers.IO) {
             JSONObject(Usquebind.getStats())
         }
-        val uptimeSec = json.optInt("uptime_sec", 0)
-        val connectedSinceMs = json.optLong("connected_since_ms", 0L)
         _stats.value = TunnelStats(
             txBytes = json.optLong("tx_bytes", 0L),
             rxBytes = json.optLong("rx_bytes", 0L),
-            connected = json.optBoolean("connected", false),
-            hasNetwork = json.optBoolean("has_network", true),
-            connectCount = json.optLong("connect_count", 0L),
-            lastError = json.optString("last_error", ""),
-            uptimeSec = uptimeSec,
-            connectedSinceMs = connectedSinceMs,
         )
-        if (_connectedSince.value == null && uptimeSec > 0) {
+        if (_connectedSince.value == null) {
+            val uptimeSec = json.optInt("uptime_sec", 0)
             _connectedSince.value = System.currentTimeMillis() - uptimeSec * 1000L
         }
     }

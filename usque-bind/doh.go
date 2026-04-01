@@ -543,15 +543,8 @@ func computePaddingSize(currentLen int) int {
 // Also resets H3 state to force a re-probe on new network.
 func (d *dohProxy) resetClient() {
 	d.clientMu.Lock()
-	old := d.client
 	d.client = d.makeClient()
 	d.clientMu.Unlock()
-
-	// Close idle connections on the old transport to release file descriptors
-	// immediately rather than waiting for IdleConnTimeout (300s).
-	if old != nil {
-		old.CloseIdleConnections()
-	}
 
 	d.h3ClientMu.Lock()
 	if d.h3Client != nil {
@@ -561,21 +554,6 @@ func (d *dohProxy) resetClient() {
 	d.h3ClientMu.Unlock()
 	d.useH3.Store(false)
 	d.h3Probed.Store(false)
-}
-
-// close releases HTTP client resources. Called when the tunnel stops.
-func (d *dohProxy) close() {
-	d.clientMu.Lock()
-	if d.client != nil {
-		d.client.CloseIdleConnections()
-	}
-	d.clientMu.Unlock()
-
-	d.h3ClientMu.Lock()
-	if d.h3Client != nil {
-		d.h3Client.CloseIdleConnections()
-	}
-	d.h3ClientMu.Unlock()
 }
 
 // ipChecksum computes the IPv4 header checksum.
@@ -678,7 +656,6 @@ type dnsInterceptor struct {
 	resolver  func(query []byte) ([]byte, error)
 	reqCh     chan dnsRequest
 	resetFunc func() // called on network change to discard stale connections
-	closeFunc func() // called on tunnel stop to release resources
 }
 
 // newDnsInterceptor creates a dnsInterceptor that resolves all DNS via DoH.
@@ -698,120 +675,23 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 			doh.resetClient()
 			doh.warmConnection()
 		},
-		closeFunc: func() {
-			doh.close()
-		},
 	}
 	d.startWorkers(ctx, 4)
 
 	return d
 }
 
-// serverSocketPool is a bounded pool of protected UDP connections for a single DNS server.
-// Reusing sockets avoids the ListenUDP + protect syscall on every query.
-type serverSocketPool struct {
-	mu    sync.Mutex
-	conns []*net.UDPConn
-}
-
-const maxPooledSocketsPerServer = 4
-
-func (p *serverSocketPool) get() *net.UDPConn {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.conns) == 0 {
-		return nil
-	}
-	conn := p.conns[len(p.conns)-1]
-	p.conns = p.conns[:len(p.conns)-1]
-	return conn
-}
-
-func (p *serverSocketPool) put(conn *net.UDPConn) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.conns) < maxPooledSocketsPerServer {
-		// Clear any lingering deadline before returning to pool
-		conn.SetDeadline(time.Time{})
-		p.conns = append(p.conns, conn)
-	} else {
-		conn.Close()
-	}
-}
-
-func (p *serverSocketPool) reset() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, conn := range p.conns {
-		conn.Close()
-	}
-	p.conns = nil
-}
-
-// protectedUDPPool manages per-server pools of protected UDP sockets.
-type protectedUDPPool struct {
-	protector VpnProtector
-	pools     sync.Map // server string → *serverSocketPool
-}
-
-func newProtectedUDPPool(protector VpnProtector) *protectedUDPPool {
-	return &protectedUDPPool{protector: protector}
-}
-
-// get returns a protected UDP socket for the given server, creating one if the pool is empty.
-func (p *protectedUDPPool) get(server string, serverAddr *net.UDPAddr) (*net.UDPConn, error) {
-	pool := p.poolFor(server)
-	if conn := pool.get(); conn != nil {
-		return conn, nil
-	}
-	// Pool empty — create and protect a new socket
-	localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-	if serverAddr.IP.To4() == nil {
-		localAddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
-	}
-	conn, err := net.ListenUDP("udp", localAddr)
-	if err != nil {
-		return nil, fmt.Errorf("listen: %w", err)
-	}
-	if err := protectUDPConn(conn, p.protector); err != nil {
-		conn.Close()
-		return nil, err
-	}
-	return conn, nil
-}
-
-// put returns a healthy socket to the pool. Call with nil or on error to discard.
-func (p *protectedUDPPool) put(server string, conn *net.UDPConn) {
-	if conn == nil {
-		return
-	}
-	p.poolFor(server).put(conn)
-}
-
-// reset closes all pooled sockets. Called on network change so stale sockets are discarded.
-func (p *protectedUDPPool) reset() {
-	p.pools.Range(func(_, value any) bool {
-		value.(*serverSocketPool).reset()
-		return true
-	})
-}
-
-func (p *protectedUDPPool) poolFor(server string) *serverSocketPool {
-	v, _ := p.pools.LoadOrStore(server, &serverSocketPool{})
-	return v.(*serverSocketPool)
-}
-
 // systemDnsResolver forwards DNS queries via protected UDP sockets to system DNS servers.
 type systemDnsResolver struct {
 	cachedResolver
 	servers   []string
-	pool      *protectedUDPPool
+	protector VpnProtector
 }
 
 func newSystemDnsResolver(servers []string, protector VpnProtector) *systemDnsResolver {
 	s := &systemDnsResolver{
-		servers: servers,
-		pool:    newProtectedUDPPool(protector),
+		servers:   servers,
+		protector: protector,
 	}
 	s.cachedResolver = *newCachedResolver(1024, s.queryServers)
 	return s
@@ -831,15 +711,27 @@ func (s *systemDnsResolver) queryServers(query []byte) ([]byte, error) {
 	return nil, fmt.Errorf("all system DNS servers failed: %v", lastErr)
 }
 
-// queryServer sends a DNS query to a single server, reusing a pooled protected socket.
+// queryServer sends a DNS query to a single server via a protected UDP socket.
 func (s *systemDnsResolver) queryServer(server string, query []byte) ([]byte, error) {
 	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(server, "53"))
 	if err != nil {
 		return nil, fmt.Errorf("resolve %s: %w", server, err)
 	}
 
-	conn, err := s.pool.get(server, addr)
+	// Determine local address family to match the server
+	localAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	if addr.IP.To4() == nil {
+		localAddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
+	}
+
+	conn, err := net.ListenUDP("udp", localAddr)
 	if err != nil {
+		return nil, fmt.Errorf("listen: %w", err)
+	}
+	defer conn.Close()
+
+	// Protect socket from VPN routing
+	if err := protectUDPConn(conn, s.protector); err != nil {
 		return nil, err
 	}
 
@@ -847,18 +739,14 @@ func (s *systemDnsResolver) queryServer(server string, query []byte) ([]byte, er
 
 	_, err = conn.WriteToUDP(query, addr)
 	if err != nil {
-		conn.Close() // discard — don't return broken socket to pool
 		return nil, fmt.Errorf("write to %s: %w", server, err)
 	}
 
 	buf := make([]byte, 4096)
 	n, err := conn.Read(buf)
 	if err != nil {
-		conn.Close() // discard — deadline or read error, socket may be stale
 		return nil, fmt.Errorf("read from %s: %w", server, err)
 	}
-
-	s.pool.put(server, conn) // return healthy socket to pool
 
 	if n < 12 {
 		return nil, fmt.Errorf("response from %s too short (%d bytes)", server, n)
@@ -881,12 +769,6 @@ func newSystemDnsInterceptor(ctx context.Context, servers []string, protector Vp
 	d := &dnsInterceptor{
 		resolver: resolver.resolve,
 		reqCh:    make(chan dnsRequest, 256),
-		resetFunc: func() {
-			resolver.pool.reset()
-		},
-		closeFunc: func() {
-			resolver.pool.reset()
-		},
 	}
 	d.startWorkers(ctx, 4)
 
@@ -921,12 +803,8 @@ func (d *dnsInterceptor) forwardUp(req dnsRequest) {
 	}
 }
 
-// close releases DNS proxy resources when the tunnel stops.
-func (d *dnsInterceptor) close() {
-	if d.closeFunc != nil {
-		d.closeFunc()
-	}
-}
+// close is a no-op (DoH client is GC'd with the interceptor).
+func (d *dnsInterceptor) close() {}
 
 // resetConnections discards stale DNS connections after a network change.
 func (d *dnsInterceptor) resetConnections() {

@@ -1,6 +1,5 @@
 package com.nhubaotruong.usqueproxy.vpn
 
-import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -19,12 +18,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
-import android.os.SystemClock
 import android.util.Log
-import java.util.concurrent.Executors
-import java.util.concurrent.ScheduledExecutorService
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicLong
 import com.nhubaotruong.usqueproxy.MainActivity
 import com.nhubaotruong.usqueproxy.R
 import com.nhubaotruong.usqueproxy.data.Office365Endpoints
@@ -61,18 +55,10 @@ class UsqueVpnService : VpnService() {
         const val TAG = "UsqueVpnService"
         const val ACTION_STOP = "com.nhubaotruong.usqueproxy.STOP_VPN"
         const val ACTION_RESTART = "com.nhubaotruong.usqueproxy.RESTART_VPN"
-        const val ACTION_KEEPALIVE_ALARM = "com.nhubaotruong.usqueproxy.KEEPALIVE_ALARM"
         const val CHANNEL_ID = "vpn_channel"
         const val NOTIFICATION_ID = 1
         private const val WATCHDOG_INTERVAL_MS = 60_000L
         private const val ERROR_GRACE_TICKS = 3 // suppress errors for 3 watchdog intervals (~3 min)
-        // Doze-proof keepalive: primary (ScheduledExecutor, 2 min) + fallback (AlarmManager, 8 min).
-        // The executor fires reliably with battery-optimization exemption (partial wake lock honored).
-        // The alarm fires during Doze maintenance windows even without exemption.
-        private const val KEEPALIVE_INTERVAL_MS = 2 * 60 * 1000L   // 2 minutes
-        private const val KEEPALIVE_ALARM_INTERVAL_MS = 8 * 60 * 1000L // 8 minutes
-        private const val KEEPALIVE_DEBOUNCE_MS = 60_000L           // skip if fired within 60s
-        private const val MAX_KEEPALIVE_FAILURES = 3              // 3 × 2min = 6min before full restart
 
         @Volatile
         var isRunning = false
@@ -134,31 +120,16 @@ class UsqueVpnService : VpnService() {
     @Volatile
     private var isDeviceIdle = false
     private var lastWatchdogRxTx: Long = 0L
-    private var lastWatchdogRx: Long = 0L   // tracks rx_bytes separately for one-way stall detection
-    private var lastWatchdogTxAtStallStart: Long = -1L // tx snapshot when rx stall began (-1 = no stall)
     private var watchdogStallCount: Int = 0
-    private var rxStallCount: Int = 0       // consecutive intervals with rx frozen but tx active
     private var errorGraceCount: Int = 0 // suppress transient errors during reconnect
     private var lastSurfacedError: String = ""
     @Volatile
     private var isManagedShutdown = false // true during stopVpnInternal, prevents self-stop in tunnelJob finally
     @Volatile
     private var isPowerSaveMode = false
-    @Volatile
-    private var screenOffAt: Long = 0L
-
-    // Doze-proof keepalive infrastructure (Tasks 4 & 5)
-    @Volatile private var consecutiveKeepaliveFailures = 0
-    private var keepaliveExecutor: ScheduledExecutorService? = null
-    // Shared debounce timestamp between ScheduledExecutor and AlarmManager receiver.
-    // Prevents double-probing when both fire within KEEPALIVE_DEBOUNCE_MS of each other.
-    private val lastKeepaliveTimeMs = AtomicLong(0L)
-    private var keepaliveAlarmPi: PendingIntent? = null
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val lifecycleMutex = Mutex()
-    @Volatile
-    private var lastStartId = 0
 
     private val powerManager by lazy { getSystemService(Context.POWER_SERVICE) as PowerManager }
     private val connectWakeLock by lazy {
@@ -169,38 +140,19 @@ class UsqueVpnService : VpnService() {
     private val idleModeReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             when (intent.action) {
-                Intent.ACTION_SCREEN_OFF -> {
-                    screenOffAt = SystemClock.elapsedRealtime()
-                }
-                Intent.ACTION_SCREEN_ON -> {
-                    // Only reconnect if screen was off long enough for the tunnel to
-                    // have gone stale (≥60s). Short unlocks (pocket check, notification
-                    // glance) don't need a reconnect and would just waste battery.
-                    val offDuration = SystemClock.elapsedRealtime() - screenOffAt
-                    if (isRunning && screenOffAt > 0L && offDuration >= 60_000L) {
-                        Log.i(TAG, "Screen on after ${offDuration / 1000}s off, reconnecting tunnel")
-                        reconnectWakeLock.acquire(30_000L)
-                        try {
-                            Usquebind.reconnect()
-                        } finally {
-                            if (reconnectWakeLock.isHeld) reconnectWakeLock.release()
-                        }
-                    }
-                }
                 PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED -> {
                     val idle = powerManager.isDeviceIdleMode
+                    val wasIdle = isDeviceIdle
                     isDeviceIdle = idle
-                    if (!idle) {
-                        Log.i(TAG, "Exiting Doze mode")
-                        // Screen-on already fired a reconnect; this is a no-op in that case.
-                        // Handles the edge case where Doze exits without a screen-on event
-                        // (e.g., incoming call, alarm).
-                        if (isRunning) restartTunnel()
+                    if (wasIdle && !idle && isRunning) {
+                        Log.i(TAG, "Exiting Doze mode, triggering reconnect")
+                        restartTunnel()
                     }
                 }
                 PowerManager.ACTION_POWER_SAVE_MODE_CHANGED -> {
                     val saving = powerManager.isPowerSaveMode
                     Log.i(TAG, "Power Save Mode: $saving")
+                    // In power save mode, increase reconnect debounce to reduce wake-ups
                     isPowerSaveMode = saving
                 }
             }
@@ -210,53 +162,6 @@ class UsqueVpnService : VpnService() {
     private val reconnectWakeLock by lazy {
         powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UsqueProxy:reconnect")
             .apply { setReferenceCounted(false) }
-    }
-
-    // AlarmManager-based keepalive receiver (Task 5).
-    // Registered/unregistered dynamically in onCreate/onDestroy — scoped to service lifetime.
-    private val alarmReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            if (intent.action != ACTION_KEEPALIVE_ALARM || !isRunning) {
-                rescheduleAlarm()
-                return
-            }
-            val now = SystemClock.elapsedRealtime()
-            if (now - lastKeepaliveTimeMs.get() < KEEPALIVE_DEBOUNCE_MS) {
-                Log.d(TAG, "AlarmManager keepalive debounced")
-                rescheduleAlarm()
-                return
-            }
-            lastKeepaliveTimeMs.set(now)
-            reconnectWakeLock.acquire(10_000L)
-            try {
-                val alive = Usquebind.keepalive()
-                Log.d(TAG, "AlarmManager keepalive: alive=$alive")
-                if (!alive && isRunning) {
-                    consecutiveKeepaliveFailures++
-                    if (consecutiveKeepaliveFailures >= MAX_KEEPALIVE_FAILURES && !Usquebind.isRunning()) {
-                        Log.w(TAG, "AlarmManager: Go tunnel exited — triggering full VPN restart")
-                        consecutiveKeepaliveFailures = 0
-                        startService(Intent(this@UsqueVpnService, UsqueVpnService::class.java).apply {
-                            action = ACTION_RESTART
-                        })
-                    } else {
-                        Log.i(TAG, "AlarmManager keepalive: dead session ($consecutiveKeepaliveFailures/$MAX_KEEPALIVE_FAILURES) — reconnecting")
-                        Usquebind.reconnect()
-                    }
-                } else {
-                    consecutiveKeepaliveFailures = 0
-                }
-            } catch (e: Exception) {
-                Log.w(TAG, "AlarmManager keepalive exception: ${e.message}")
-            } finally {
-                if (reconnectWakeLock.isHeld) reconnectWakeLock.release()
-            }
-            rescheduleAlarm()
-        }
-
-        private fun rescheduleAlarm() {
-            if (isRunning) scheduleKeepaliveAlarm()
-        }
     }
 
     private val reconnectHandler = Handler(Looper.getMainLooper())
@@ -315,36 +220,7 @@ class UsqueVpnService : VpnService() {
                     updateNotification("Reconnecting...")
                 }
 
-                val rxBytes = stats.optLong("rx_bytes", 0)
-                val txBytes = stats.optLong("tx_bytes", 0)
-
-                // One-way stall detection: rx frozen while tx is active.
-                // This catches the case where Cloudflare silently stops forwarding — the
-                // server drops our packets but the QUIC connection stays alive (keepalives
-                // work at transport level). Combined rxTx would keep changing (tx active),
-                // so the old check below would never trigger. Track rx separately.
-                if (goConnected && rxBytes == lastWatchdogRx && txBytes > 0L) {
-                    // rx unchanged but tx is nonzero — potential one-way stall
-                    if (lastWatchdogTxAtStallStart < 0L) {
-                        lastWatchdogTxAtStallStart = txBytes // first interval of stall
-                    }
-                    val txGrew = txBytes > lastWatchdogTxAtStallStart
-                    if (txGrew) {
-                        rxStallCount++
-                        if (rxStallCount >= 2) { // 2 intervals = ~2 min backup trigger
-                            Log.w(TAG, "One-way stall: rx frozen for ${rxStallCount * WATCHDOG_INTERVAL_MS / 1000}s while tx active, triggering reconnect")
-                            Usquebind.reconnect()
-                            rxStallCount = 0
-                            lastWatchdogTxAtStallStart = -1L
-                        }
-                    }
-                } else {
-                    rxStallCount = 0
-                    lastWatchdogTxAtStallStart = -1L
-                }
-                lastWatchdogRx = rxBytes
-
-                // Total-stall detection (fallback): no traffic at all for 3+ intervals.
+                // Stuck detection: tunnel says connected but no traffic for 2+ intervals
                 if (goConnected && rxTx > 0L && rxTx == lastWatchdogRxTx) {
                     watchdogStallCount++
                     if (watchdogStallCount >= 3) { // 3 intervals = ~3 min stall
@@ -367,16 +243,9 @@ class UsqueVpnService : VpnService() {
         registerReceiver(
             idleModeReceiver,
             IntentFilter().apply {
-                addAction(Intent.ACTION_SCREEN_OFF)
-                addAction(Intent.ACTION_SCREEN_ON)
                 addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
                 addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
             },
-            Context.RECEIVER_NOT_EXPORTED
-        )
-        registerReceiver(
-            alarmReceiver,
-            IntentFilter(ACTION_KEEPALIVE_ALARM),
             Context.RECEIVER_NOT_EXPORTED
         )
         isDeviceIdle = powerManager.isDeviceIdleMode
@@ -384,7 +253,6 @@ class UsqueVpnService : VpnService() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        lastStartId = startId
         when {
             // OS restarted service after process death — restore tunnel from prefs
             intent == null -> {
@@ -394,14 +262,13 @@ class UsqueVpnService : VpnService() {
                 return START_STICKY
             }
             intent.action == ACTION_STOP -> {
-                val capturedStartId = startId
-                serviceScope.launch { stopVpnInternal(capturedStartId) }
+                serviceScope.launch { stopVpnInternal() }
                 return START_NOT_STICKY
             }
             intent.action == ACTION_RESTART -> {
                 startForeground(NOTIFICATION_ID, buildNotification())
                 serviceScope.launch {
-                    stopVpnInternal(stopService = false)
+                    stopVpnInternal()
                     yield() // allow cancellation between stop and start
                     launchStartJob()
                 }
@@ -520,6 +387,9 @@ class UsqueVpnService : VpnService() {
             }
         }
 
+        // Pass current network type for adaptive keepalive
+        config.put("network_type", detectNetworkType())
+
         val configJson = config.toString()
 
         // Routes: catch-all + exclusions
@@ -627,114 +497,17 @@ class UsqueVpnService : VpnService() {
 
         registerNetworkCallback()
         startWatchdog()
-        startKeepaliveExecutor()
-        scheduleKeepaliveAlarm()
     }
 
     private fun startWatchdog() {
         lastWatchdogRxTx = 0L
-        lastWatchdogRx = 0L
-        lastWatchdogTxAtStallStart = -1L
         watchdogStallCount = 0
-        rxStallCount = 0
-        errorGraceCount = 0
         reconnectHandler.removeCallbacks(watchdogRunnable)
         reconnectHandler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS)
     }
 
     private fun stopWatchdog() {
         reconnectHandler.removeCallbacks(watchdogRunnable)
-    }
-
-    // --- Doze-proof keepalive (Tasks 4 & 5) ---
-
-    /**
-     * Starts a [ScheduledExecutorService] that fires every 2 minutes.
-     * Each tick acquires a partial wake lock (~1-2s), calls [Usquebind.keepalive] to
-     * probe the QUIC session, and reconnects if the probe detects a dead session.
-     *
-     * With battery-optimization exemption (prompted in MainActivity), partial wake
-     * locks are honoured even during Doze — keeping this 2-min interval reliable.
-     * Without exemption, tasks may be deferred; the [AlarmManager] fallback covers that.
-     */
-    private fun startKeepaliveExecutor() {
-        keepaliveExecutor?.shutdownNow()
-        lastKeepaliveTimeMs.set(0L)
-        consecutiveKeepaliveFailures = 0
-        keepaliveExecutor = Executors.newSingleThreadScheduledExecutor { r ->
-            Thread(r, "usque-keepalive").also { it.isDaemon = true }
-        }.also { exec ->
-            exec.scheduleAtFixedRate({
-                if (!isRunning) return@scheduleAtFixedRate
-                val now = SystemClock.elapsedRealtime()
-                if (now - lastKeepaliveTimeMs.get() < KEEPALIVE_DEBOUNCE_MS) {
-                    Log.d(TAG, "Keepalive executor debounced")
-                    return@scheduleAtFixedRate
-                }
-                lastKeepaliveTimeMs.set(now)
-                reconnectWakeLock.acquire(10_000L)
-                try {
-                    val alive = Usquebind.keepalive()
-                    Log.d(TAG, "Keepalive executor probe: alive=$alive")
-                    if (!alive && isRunning) {
-                        consecutiveKeepaliveFailures++
-                        if (consecutiveKeepaliveFailures >= MAX_KEEPALIVE_FAILURES && !Usquebind.isRunning()) {
-                            Log.w(TAG, "Go tunnel exited — triggering full VPN restart")
-                            consecutiveKeepaliveFailures = 0
-                            startService(Intent(this@UsqueVpnService, UsqueVpnService::class.java).apply {
-                                action = ACTION_RESTART
-                            })
-                        } else {
-                            Log.i(TAG, "Keepalive: dead session ($consecutiveKeepaliveFailures/$MAX_KEEPALIVE_FAILURES) — reconnecting")
-                            Usquebind.reconnect()
-                        }
-                    } else {
-                        consecutiveKeepaliveFailures = 0
-                    }
-                } catch (e: Exception) {
-                    Log.w(TAG, "Keepalive executor exception: ${e.message}")
-                } finally {
-                    if (reconnectWakeLock.isHeld) reconnectWakeLock.release()
-                }
-            }, KEEPALIVE_INTERVAL_MS, KEEPALIVE_INTERVAL_MS, TimeUnit.MILLISECONDS)
-        }
-    }
-
-    private fun stopKeepaliveExecutor() {
-        keepaliveExecutor?.shutdownNow()
-        keepaliveExecutor = null
-    }
-
-    /**
-     * Schedules an [AlarmManager.setExactAndAllowWhileIdle] alarm as a belt-and-suspenders
-     * fallback for users without battery-optimization exemption.
-     *
-     * [setExactAndAllowWhileIdle] fires during Doze maintenance windows even without exemption,
-     * though OEMs typically throttle it to once per ~9 minutes.
-     *
-     * The alarm is one-shot — [alarmReceiver] re-schedules it after each fire.
-     */
-    private fun scheduleKeepaliveAlarm() {
-        val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val intent = Intent(ACTION_KEEPALIVE_ALARM)
-        val pi = PendingIntent.getBroadcast(
-            this, 0, intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-        )
-        keepaliveAlarmPi = pi
-        am.setExactAndAllowWhileIdle(
-            AlarmManager.ELAPSED_REALTIME_WAKEUP,
-            SystemClock.elapsedRealtime() + KEEPALIVE_ALARM_INTERVAL_MS,
-            pi,
-        )
-    }
-
-    private fun cancelKeepaliveAlarm() {
-        keepaliveAlarmPi?.let { pi ->
-            val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-            am.cancel(pi)
-            keepaliveAlarmPi = null
-        }
     }
 
     /**
@@ -749,6 +522,7 @@ class UsqueVpnService : VpnService() {
                 val previous = currentNetwork
                 currentNetwork = network
                 underlyingNetworkSet = false
+                cm.getNetworkCapabilities(network)?.let { updateNetworkHint(it) }
                 if (isRunning) {
                     setUnderlyingNetworks(arrayOf(network))
                     underlyingNetworkSet = true
@@ -789,6 +563,7 @@ class UsqueVpnService : VpnService() {
                     caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
                     underlyingNetworkSet = true
                     setUnderlyingNetworks(arrayOf(network))
+                    updateNetworkHint(caps)
                 }
             }
         }
@@ -842,14 +617,8 @@ class UsqueVpnService : VpnService() {
     /**
      * Performs full VPN shutdown. Serialized via [lifecycleMutex] to prevent
      * concurrent start/stop races.
-     *
-     * @param stopStartId if non-null, calls stopSelf(startId) — Android will only
-     *   destroy the service if no newer onStartCommand arrived (prevents the
-     *   stop→start-quickly race from killing a freshly-started service).
-     * @param stopService if false, skips stopForeground/stopSelf entirely
-     *   (used by ACTION_RESTART which will immediately re-start).
      */
-    private suspend fun stopVpnInternal(stopStartId: Int? = null, stopService: Boolean = true) {
+    private suspend fun stopVpnInternal() {
         // Cancel startJob BEFORE acquiring mutex to avoid deadlock:
         // startJob holds mutex during setup, stop needs mutex for teardown.
         startJob?.cancel()
@@ -861,8 +630,6 @@ class UsqueVpnService : VpnService() {
         updateNotification("Disconnecting...")
         reconnectHandler.removeCallbacks(reconnectRunnable)
         stopWatchdog()
-        stopKeepaliveExecutor()
-        cancelKeepaliveAlarm()
         unregisterNetworkCallback()
         Usquebind.stopTunnel()
         // Wait up to 3s for tunnel to shut down gracefully; cancel if it hangs
@@ -877,22 +644,9 @@ class UsqueVpnService : VpnService() {
         isRunning = false
         _events.tryEmit(VpnServiceEvent.Stopped)
         VpnTileService.requestUpdate(this)
-        if (stopService) {
-            // Check if a newer start arrived while we were tearing down — if so,
-            // don't kill the service or remove foreground status.
-            val shouldStop = stopStartId == null || stopStartId >= lastStartId
-            if (shouldStop) {
-                withContext(Dispatchers.Main) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    if (stopStartId != null) {
-                        stopSelf(stopStartId)
-                    } else {
-                        stopSelf()
-                    }
-                }
-            } else {
-                Log.i(TAG, "Skipping stopSelf: newer start (id=$lastStartId) arrived after stop (id=$stopStartId)")
-            }
+        withContext(Dispatchers.Main) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
         }
         } finally {
             isManagedShutdown = false
@@ -903,10 +657,7 @@ class UsqueVpnService : VpnService() {
     override fun onDestroy() {
         reconnectHandler.removeCallbacks(reconnectRunnable)
         stopWatchdog()
-        stopKeepaliveExecutor()
-        cancelKeepaliveAlarm()
         runCatching { unregisterReceiver(idleModeReceiver) }
-        runCatching { unregisterReceiver(alarmReceiver) }
         // Synchronous cleanup: stop tunnel and cancel scope
         Usquebind.stopTunnel()
         tunnelJob?.cancel()
@@ -920,8 +671,6 @@ class UsqueVpnService : VpnService() {
         // Synchronous cleanup — onRevoke may be followed immediately by onDestroy
         reconnectHandler.removeCallbacks(reconnectRunnable)
         stopWatchdog()
-        stopKeepaliveExecutor()
-        cancelKeepaliveAlarm()
         unregisterNetworkCallback()
         Usquebind.stopTunnel()
         tunnelJob?.cancel()
@@ -944,23 +693,20 @@ class UsqueVpnService : VpnService() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val dynamicExclusions = mutableListOf<IpPrefix>()
 
-        // Discover actual local network subnets from the active network's link properties.
-        // Uses the active network (which is what matters for local LAN access) instead of
-        // the deprecated ConnectivityManager.allNetworks.
+        // Discover actual local network subnets from all non-VPN, non-cellular networks
         runCatching {
-            val activeNetwork = cm.activeNetwork
-            if (activeNetwork != null) {
-                val lp = cm.getLinkProperties(activeNetwork)
-                if (lp != null) {
-                    for (la in lp.linkAddresses) {
-                        val addr = la.address
-                        val prefix = la.prefixLength
-                        // Only include private/link-local addresses
-                        if (addr.isLinkLocalAddress || addr.isSiteLocalAddress ||
-                            addr.isLoopbackAddress || isPrivateAddress(addr)
-                        ) {
-                            dynamicExclusions.add(IpPrefix(addr, prefix))
-                        }
+            for (network in cm.allNetworks) {
+                val caps = cm.getNetworkCapabilities(network) ?: continue
+                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+                val lp = cm.getLinkProperties(network) ?: continue
+                for (la in lp.linkAddresses) {
+                    val addr = la.address
+                    val prefix = la.prefixLength
+                    // Only include private/link-local addresses
+                    if (addr.isLinkLocalAddress || addr.isSiteLocalAddress ||
+                        addr.isLoopbackAddress || isPrivateAddress(addr)
+                    ) {
+                        dynamicExclusions.add(IpPrefix(addr, prefix))
                     }
                 }
             }
@@ -1004,6 +750,26 @@ class UsqueVpnService : VpnService() {
         lp.isPrivateDnsActive && lp.privateDnsServerName != null
     } catch (_: Exception) {
         false
+    }
+
+    private fun detectNetworkType(): String {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val network = cm.activeNetwork ?: return ""
+        val caps = cm.getNetworkCapabilities(network) ?: return ""
+        return when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            else -> ""
+        }
+    }
+
+    private fun updateNetworkHint(caps: NetworkCapabilities) {
+        val hint = when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "wifi"
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
+            else -> ""
+        }
+        Usquebind.setNetworkHint(hint)
     }
 
     private fun getSystemDnsServers(): List<String> = try {

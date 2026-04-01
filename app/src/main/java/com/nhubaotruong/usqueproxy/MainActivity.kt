@@ -1,12 +1,8 @@
 package com.nhubaotruong.usqueproxy
 
-import android.content.Context
 import android.content.Intent
-import android.net.Uri
 import android.net.VpnService
 import android.os.Bundle
-import android.os.PowerManager
-import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -43,7 +39,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-        checkBatteryOptimization()
         setContent {
             val prefs by vpnViewModel.vpnPrefs.collectAsStateWithLifecycle()
             val darkTheme = when (prefs.themeMode) {
@@ -79,18 +74,6 @@ class MainActivity : ComponentActivity() {
     private fun handleConnectAction(intent: Intent?) {
         if (intent?.action == ACTION_CONNECT_VPN) {
             requestVpnPermission()
-        }
-    }
-
-    private fun checkBatteryOptimization() {
-        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-            startActivity(
-                Intent(
-                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
-                    Uri.parse("package:$packageName"),
-                )
-            )
         }
     }
 

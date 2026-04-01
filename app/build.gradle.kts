@@ -22,8 +22,8 @@ android {
         applicationId = "com.nhubaotruong.usqueproxy"
         minSdk = 35
         targetSdk = 36
-        versionCode = 3
-        versionName = "1.38"
+        versionCode = 1
+        versionName = "1.27"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

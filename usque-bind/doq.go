@@ -15,15 +15,6 @@ import (
 	"github.com/quic-go/quic-go"
 )
 
-// doqWritePool reuses buffers for the 2-byte length prefix + query sent per stream.
-// Uses pointer-to-slice idiom (same as dnsQueryPool in bind.go) to allow append without escape.
-var doqWritePool = sync.Pool{
-	New: func() any {
-		b := make([]byte, 0, 2+512) // 2-byte prefix + typical DNS query
-		return &b
-	},
-}
-
 // doqProxy resolves DNS queries over QUIC (RFC 9250).
 type doqProxy struct {
 	cachedResolver
@@ -154,26 +145,23 @@ func (d *doqProxy) doFetch(query []byte) ([]byte, error) {
 	}
 
 	// Write 2-byte length prefix + query (RFC 9250 §4.2)
-	bufPtr := doqWritePool.Get().(*[]byte)
-	msg := append((*bufPtr)[:0], 0, 0) // reserve 2 bytes for length prefix
+	msg := make([]byte, 2+len(query))
 	binary.BigEndian.PutUint16(msg, uint16(len(query)))
-	msg = append(msg, query...)
-	_, writeErr := stream.Write(msg)
-	doqWritePool.Put(bufPtr) // safe to return: stream.Write copies into QUIC send buffer
-	if writeErr != nil {
+	copy(msg[2:], query)
+	if _, err := stream.Write(msg); err != nil {
 		stream.CancelRead(0)
 		stream.CancelWrite(0)
-		return nil, fmt.Errorf("DoQ write: %w", writeErr)
+		return nil, fmt.Errorf("DoQ write: %w", err)
 	}
 	// Send FIN to indicate we're done writing
 	stream.Close()
 
-	// Read 2-byte length prefix + response (stack allocation — no heap)
-	var respLenBuf [2]byte
-	if _, err := io.ReadFull(stream, respLenBuf[:]); err != nil {
+	// Read 2-byte length prefix + response
+	respLenBuf := make([]byte, 2)
+	if _, err := io.ReadFull(stream, respLenBuf); err != nil {
 		return nil, fmt.Errorf("DoQ read resp len: %w", err)
 	}
-	respLen := binary.BigEndian.Uint16(respLenBuf[:])
+	respLen := binary.BigEndian.Uint16(respLenBuf)
 	if respLen < 12 || respLen > 4096 {
 		return nil, fmt.Errorf("DoQ invalid response length: %d", respLen)
 	}
@@ -235,9 +223,6 @@ func newDoqDnsInterceptor(ctx context.Context, doqAddr string, protector VpnProt
 		resetFunc: func() {
 			doq.resetConn()
 			doq.warmConnection()
-		},
-		closeFunc: func() {
-			doq.resetConn()
 		},
 	}
 	d.startWorkers(ctx, 4)
