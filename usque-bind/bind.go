@@ -471,12 +471,10 @@ func cleanEndpoint(ep string) string {
 // directly because it calls ConnectTunnel without a protect() hook.
 func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDevice, protector VpnProtector) error {
 	const (
-		mtu              = 1280
-		connectPort      = 443
-		minBackoff       = 1 * time.Second
-		maxBackoff       = 60 * time.Second
-		certRenewBefore  = 1 * time.Hour  // renew cert 1h before expiry
-		maxConnLifetime  = 2 * time.Hour  // force reconnect to prevent silent MASQUE degradation
+		mtu             = 1280
+		connectPort     = 443
+		certRenewBefore = 1 * time.Hour
+		reconnectDelay  = 1 * time.Second
 	)
 
 	privKey, err := cfg.GetEcPrivateKey()
@@ -525,11 +523,6 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	var cachedCert [][]byte
 	var certExpiry time.Time
 
-	const networkGraceMax = 3 // attempts at minBackoff after network change before escalating
-
-	backoff := minBackoff
-	networkGraceAttempts := 0
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -543,11 +536,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			if err != nil {
 				lastError.Store(err.Error())
 				log.Printf("cert generation: %v", err)
-				if sleepCtxReconnectable(ctx, backoff, reconnectCh) {
-					backoff = minBackoff
-				} else {
-					backoff = nextBackoff(backoff, maxBackoff)
-				}
+				sleepCtxReconnectable(ctx, reconnectDelay, reconnectCh)
 				continue
 			}
 			cachedCert = cert
@@ -558,11 +547,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		if err != nil {
 			lastError.Store(err.Error())
 			log.Printf("TLS config: %v", err)
-			if sleepCtxReconnectable(ctx, backoff, reconnectCh) {
-				backoff = minBackoff
-			} else {
-				backoff = nextBackoff(backoff, maxBackoff)
-			}
+			sleepCtxReconnectable(ctx, reconnectDelay, reconnectCh)
 			continue
 		}
 
@@ -571,7 +556,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		quicCfg := &quic.Config{
 			EnableDatagrams:         true,
 			InitialPacketSize:       1280,
-			KeepAlivePeriod:         25 * time.Second,
+			KeepAlivePeriod:         30 * time.Second,
 			MaxIdleTimeout:          120 * time.Second,
 			DisablePathMTUDiscovery: true,
 		}
@@ -587,15 +572,10 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			log.Printf("connect: %v", err)
 			// If no network, wait for SetConnectivity(true) instead of hammering
 			if !hasNetwork.Load() {
-				log.Println("no network — waiting for connectivity")
+				log.Println("no network -- waiting for connectivity")
 				waitForNetwork(ctx)
-				backoff = minBackoff
 			} else {
-				if sleepCtxReconnectable(ctx, backoff, reconnectCh) {
-					backoff = minBackoff
-				} else {
-					backoff = nextBackoff(backoff, maxBackoff)
-				}
+				sleepCtxReconnectable(ctx, reconnectDelay, reconnectCh)
 			}
 			continue
 		}
@@ -603,16 +583,10 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			lastError.Store(fmt.Sprintf("tunnel rejected: %s", rsp.Status))
 			log.Printf("tunnel rejected: %s", rsp.Status)
 			cleanup(ipConn, udpConn, tr)
-			if sleepCtxReconnectable(ctx, backoff, reconnectCh) {
-				backoff = minBackoff
-			} else {
-				backoff = nextBackoff(backoff, maxBackoff)
-			}
+			sleepCtxReconnectable(ctx, reconnectDelay, reconnectCh)
 			continue
 		}
 
-		// Connection succeeded — reset backoff.
-		backoff = minBackoff
 		connected.Store(true)
 		connectedAt.Store(time.Now().UnixMilli())
 		lastError.Store("")
@@ -629,18 +603,12 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		default:
 		}
 
-		// Per-connection context: cancelled when this connection ends, which stops
-		// the liveness goroutine immediately without waiting for its next tick.
-		connCtx, connCancel := context.WithCancel(ctx)
-
 		errChan := make(chan error, 2)
 		var wg sync.WaitGroup
-		wg.Add(3)
+		wg.Add(2)
 		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, dnsCache) }()
 		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache) }()
-		go func() { defer wg.Done(); livenessCheck(connCtx) }()
 
-		lifetimeTimer := time.NewTimer(maxConnLifetime)
 		select {
 		case err = <-errChan:
 			connected.Store(false)
@@ -651,48 +619,24 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			connected.Store(false)
 			connectedAt.Store(0)
 			log.Println("reconnect requested")
-			if networkTriggered.Swap(false) {
-				backoff = 200 * time.Millisecond // micro-delay lets new network's routing stabilize
-				networkGraceAttempts = networkGraceMax
-			} else {
-				backoff = minBackoff
-			}
-		case <-lifetimeTimer.C:
-			connected.Store(false)
-			connectedAt.Store(0)
-			lifetimeRotations.Add(1)
-			log.Printf("max connection lifetime (%v) reached, rotating tunnel", maxConnLifetime)
-			backoff = 200 * time.Millisecond
 		case <-ctx.Done():
 			connected.Store(false)
 			connectedAt.Store(0)
 		}
-		lifetimeTimer.Stop()
 
-		connCancel() // stop liveness goroutine immediately
 		cleanup(ipConn, udpConn, tr)
-		wg.Wait() // wait for forwarding goroutines to exit before reconnecting
+		wg.Wait()
 		if ctx.Err() != nil {
 			return nil
 		}
-
-		// Always reset DNS connections on reconnect — DoH/DoQ maintain persistent
-		// connections that go stale when the tunnel dies (e.g., screen off).
 		if dns != nil {
 			dns.resetConnections()
 		}
-
-		if backoff > 0 {
-			if sleepCtxReconnectable(ctx, backoff, reconnectCh) {
-				backoff = minBackoff
-				continue // skip backoff escalation, retry immediately
-			}
-		}
-		if networkGraceAttempts > 0 {
-			networkGraceAttempts--
-			backoff = minBackoff // hold at minBackoff during grace period
+		// Network-triggered reconnect gets 200ms for routing stabilization (D-06)
+		if networkTriggered.Swap(false) {
+			sleepCtxReconnectable(ctx, 200*time.Millisecond, reconnectCh)
 		} else {
-			backoff = nextBackoff(backoff, maxBackoff)
+			sleepCtxReconnectable(ctx, reconnectDelay, reconnectCh)
 		}
 	}
 }
