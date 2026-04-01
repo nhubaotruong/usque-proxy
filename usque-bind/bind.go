@@ -15,7 +15,7 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	mrand "math/rand/v2"
+
 	"net"
 	"net/http"
 	"os"
@@ -137,11 +137,7 @@ var (
 	lastRxTime atomic.Int64 // Unix nanos of last received IP packet from tunnel
 	lastTxTime atomic.Int64 // Unix nanos of last IP packet written to tunnel
 
-	// Packet counters for delivery ratio monitoring.
-	txPackets          atomic.Int64
-	rxPackets          atomic.Int64
-	lastDeliveryRatio  atomic.Int64 // ratio × 100 (e.g. 95 = 95%), -1 = not enough data
-	lifetimeRotations  atomic.Int64 // number of max-lifetime forced reconnects
+
 )
 
 // StartTunnel starts the MASQUE tunnel. Blocks until StopTunnel or error.
@@ -191,10 +187,6 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	rxBytes.Store(0)
 	lastRxTime.Store(0)
 	lastTxTime.Store(0)
-	txPackets.Store(0)
-	rxPackets.Store(0)
-	lastDeliveryRatio.Store(-1)
-	lifetimeRotations.Store(0)
 	mu.Unlock()
 
 	// Dup the fd so Go owns an independent copy. Without this, Go's GC
@@ -333,19 +325,8 @@ func GetStats() string {
 		stats["connected_since_ms"] = t
 	}
 	// Diagnostic fields for liveness/stall monitoring.
-	if rxNs := lastRxTime.Load(); rxNs > 0 {
-		stats["last_rx_time_ms"] = rxNs / int64(time.Millisecond)
-		if connected.Load() {
-			stats["rx_stall_sec"] = int(now.Sub(time.Unix(0, rxNs)).Seconds())
-		}
-	}
-	if txNs := lastTxTime.Load(); txNs > 0 {
-		stats["last_tx_time_ms"] = txNs / int64(time.Millisecond)
-	}
-	stats["tx_packets"] = txPackets.Load()
-	stats["rx_packets"] = rxPackets.Load()
-	stats["delivery_ratio"] = lastDeliveryRatio.Load()
-	stats["lifetime_rotations"] = lifetimeRotations.Load()
+
+
 	b, _ := json.Marshal(stats)
 	return string(b)
 }
@@ -641,18 +622,6 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	}
 }
 
-// nextBackoff doubles the current backoff, capped at max, with 0–25% random jitter.
-func nextBackoff(current, max time.Duration) time.Duration {
-	next := current * 2
-	if next > max {
-		next = max
-	}
-	if quarter := int64(next) / 4; quarter > 0 {
-		next += time.Duration(mrand.Int64N(quarter))
-	}
-	return next
-}
-
 // connectHappyEyeballs implements Happy Eyeballs v3 (RFC 8305 / draft-ietf-happy-happyeyeballs-v3)
 // for the QUIC/Connect-IP tunnel connection. It races IPv6 and IPv4 with a
 // 250ms staggered delay, preferring IPv6 per the spec.
@@ -865,7 +834,6 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 			continue
 		}
 		lastTxTime.Store(time.Now().UnixNano())
-		txPackets.Add(1)
 		if len(icmp) > 0 {
 			if err := device.WritePacket(icmp); err != nil {
 				if errors.As(err, new(*connectip.CloseError)) {
@@ -894,86 +862,12 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, _ *api.NetBuff
 		}
 		lastRxTime.Store(time.Now().UnixNano())
 		rxBytes.Add(int64(n))
-		rxPackets.Add(1)
 		if dnsCache != nil {
 			dnsCache.cacheResponse(buf[:n])
 		}
 		if err := device.WritePacket(buf[:n]); err != nil {
 			errChan <- fmt.Errorf("failed to write to TUN device: %v", err)
 			return
-		}
-	}
-}
-
-// livenessCheck periodically detects one-way tunnel stalls where the server
-// has silently stopped forwarding (rx frozen) while the client is still
-// sending traffic (tx active). This covers the case where the Cloudflare
-// MASQUE session expires server-side but the QUIC connection remains alive
-// (keepalives keep the transport up, so forwardDown never gets an error).
-//
-// Stall condition: no rx packet for >30s AND tx packet within last 30s.
-// Idle connections (both rx and tx silent) do NOT trigger a reconnect.
-//
-// Also detects partial degradation: if the tunnel delivers <10% of expected
-// packets for 2 consecutive windows while actively sending, it reconnects.
-//
-// Exits immediately when ctx is cancelled (connection ended or reconnecting).
-func livenessCheck(ctx context.Context) {
-	const (
-		rxStallTimeout            = 30 * time.Second
-		txActiveWindow            = 30 * time.Second
-		checkInterval             = 10 * time.Second
-		minTxForRatioCheck  int64 = 50   // need meaningful sample before evaluating ratio
-		degradedThreshold         = 0.10 // <10% delivery = degraded
-		degradedWindowsMax        = 2    // consecutive degraded windows to trigger reconnect
-	)
-	ticker := time.NewTicker(checkInterval)
-	defer ticker.Stop()
-
-	var prevTxPkts, prevRxPkts int64
-	var degradedCount int
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			now := time.Now()
-			rxAge := now.Sub(time.Unix(0, lastRxTime.Load()))
-			txAge := now.Sub(time.Unix(0, lastTxTime.Load()))
-			if rxAge > rxStallTimeout && txAge < txActiveWindow {
-				log.Printf("liveness: rx stall detected (no rx for %.0fs, last tx %.0fs ago) — triggering reconnect",
-					rxAge.Seconds(), txAge.Seconds())
-				Reconnect()
-				return // one reconnect signal is enough; exit so we don't spam
-			}
-
-			// Delivery ratio check: detect partial degradation where some
-			// packets get through but many are dropped silently.
-			curTx := txPackets.Load()
-			curRx := rxPackets.Load()
-			windowTx := curTx - prevTxPkts
-			windowRx := curRx - prevRxPkts
-			prevTxPkts = curTx
-			prevRxPkts = curRx
-
-			if windowTx >= minTxForRatioCheck {
-				ratio := float64(windowRx) / float64(windowTx)
-				lastDeliveryRatio.Store(int64(ratio * 100))
-				if ratio < degradedThreshold {
-					degradedCount++
-					if degradedCount >= degradedWindowsMax {
-						log.Printf("liveness: degraded delivery ratio %.1f%% over %d windows — triggering reconnect",
-							ratio*100, degradedCount)
-						Reconnect()
-						return
-					}
-				} else {
-					degradedCount = 0
-				}
-			} else {
-				degradedCount = 0
-			}
 		}
 	}
 }
