@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"log"
 	"math/big"
-	mrand "math/rand/v2"
 	"net"
 	"net/http"
 	"os"
@@ -66,7 +65,6 @@ type tunnelConfig struct {
 	ConnectURI  string   `json:"connect_uri"`
 	DoHURL      string   `json:"doh_url"`
 	DoQURL      string   `json:"doq_url"`
-	NetworkType    string   `json:"network_type"`
 	SystemDNS      []string `json:"system_dns"`
 	PrivateDNS     bool     `json:"private_dns_active"`
 }
@@ -167,7 +165,6 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	reconnectCh = make(chan struct{}, 1)
 	running.Store(true)
 	connected.Store(false)
-	networkTriggered.Store(false)
 	hasNetwork.Store(true)
 	lastError.Store("")
 	startTime = time.Now()
@@ -196,20 +193,6 @@ func StopTunnel() {
 	}
 }
 
-// networkTriggered is set by Reconnect() to signal that the reconnect was
-// caused by a network change, so maintainTunnel can skip the initial backoff.
-var networkTriggered atomic.Bool
-
-// networkHint stores the current network type ("wifi", "cellular", or "")
-// for adaptive keepalive intervals. Updated from Kotlin via SetNetworkHint.
-var networkHint atomic.Value
-
-// SetNetworkHint updates the network type hint for adaptive keepalive.
-// Call from Kotlin on network change: "wifi", "cellular", or "" (unknown).
-func SetNetworkHint(hint string) {
-	networkHint.Store(hint)
-}
-
 // SetConnectivity tells the tunnel whether the device has network.
 // When false, the reconnect loop sleeps instead of hammering failed dials.
 // Call from Kotlin: true on onAvailable, false on onLost (no active network).
@@ -224,7 +207,6 @@ func SetConnectivity(networkAvailable bool) {
 // Reconnect tears down the current QUIC connection but keeps the reconnect
 // loop alive so it re-establishes on the (possibly new) network.
 func Reconnect() {
-	networkTriggered.Store(true)
 	mu.Lock()
 	ch := reconnectCh
 	mu.Unlock()
@@ -387,10 +369,8 @@ func cleanEndpoint(ep string) string {
 func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDevice, protector VpnProtector) error {
 	const (
 		mtu             = 1280
-		packetSize      = 1242
 		connectPort     = 443
-		minBackoff      = 1 * time.Second
-		maxBackoff      = 60 * time.Second
+		reconnectDelay  = 1 * time.Second
 		certRenewBefore = 1 * time.Hour // renew cert 1h before expiry
 	)
 
@@ -440,16 +420,6 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	var cachedCert [][]byte
 	var certExpiry time.Time
 
-	const networkGraceMax = 3 // attempts at minBackoff after network change before escalating
-
-	// Seed network hint from config; Kotlin will update dynamically via SetNetworkHint.
-	if cfg.NetworkType != "" {
-		networkHint.Store(cfg.NetworkType)
-	}
-
-	backoff := minBackoff
-	networkGraceAttempts := 0
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -463,8 +433,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			if err != nil {
 				lastError.Store(err.Error())
 				log.Printf("cert generation: %v", err)
-				sleepCtx(ctx, backoff)
-				backoff = nextBackoff(backoff, maxBackoff)
+				sleepCtx(ctx, reconnectDelay)
 				continue
 			}
 			cachedCert = cert
@@ -475,40 +444,18 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		if err != nil {
 			lastError.Store(err.Error())
 			log.Printf("TLS config: %v", err)
-			sleepCtx(ctx, backoff)
-			backoff = nextBackoff(backoff, maxBackoff)
+			sleepCtx(ctx, reconnectDelay)
 			continue
 		}
 
 		tlsCfg.ClientSessionCache = quicSessionCache // 1-RTT session resumption (not 0-RTT)
 
-		// Adaptive keepalive and PMTU based on network type
-		var hint string
-		if v := networkHint.Load(); v != nil {
-			hint = v.(string)
-		}
-
-		keepalive := 55 * time.Second
-		switch hint {
-		case "wifi":
-			keepalive = 110 * time.Second
-		case "cellular":
-			keepalive = 50 * time.Second
-		}
-
-		disablePMTU := true
-		pktSize := uint16(packetSize) // 1242
-		if hint == "wifi" {
-			disablePMTU = false
-			pktSize = 1400
-		}
-
 		quicCfg := &quic.Config{
 			EnableDatagrams:         true,
-			InitialPacketSize:       pktSize,
-			KeepAlivePeriod:         keepalive,
-			MaxIdleTimeout:          300 * time.Second, // 3+ keepalive rounds before timeout; CF allows up to 300s
-			DisablePathMTUDiscovery: disablePMTU,
+			InitialPacketSize:       1280,
+			KeepAlivePeriod:         30 * time.Second,
+			MaxIdleTimeout:          120 * time.Second,
+			DisablePathMTUDiscovery: true,
 		}
 
 		connectCount.Add(1)
@@ -524,10 +471,8 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			if !hasNetwork.Load() {
 				log.Println("no network — waiting for connectivity")
 				waitForNetwork(ctx)
-				backoff = minBackoff
 			} else {
-				sleepCtx(ctx, backoff)
-				backoff = nextBackoff(backoff, maxBackoff)
+				sleepCtx(ctx, reconnectDelay)
 			}
 			continue
 		}
@@ -535,13 +480,10 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			lastError.Store(fmt.Sprintf("tunnel rejected: %s", rsp.Status))
 			log.Printf("tunnel rejected: %s", rsp.Status)
 			cleanup(ipConn, udpConn, tr)
-			sleepCtx(ctx, backoff)
-			backoff = nextBackoff(backoff, maxBackoff)
+			sleepCtx(ctx, reconnectDelay)
 			continue
 		}
 
-		// Connection succeeded — reset backoff.
-		backoff = minBackoff
 		connected.Store(true)
 		connectedAt.Store(time.Now().UnixMilli())
 		lastError.Store("")
@@ -553,7 +495,6 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, dnsCache) }()
 		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache) }()
 
-		isNetworkReconnect := false
 		select {
 		case err = <-errChan:
 			connected.Store(false)
@@ -564,13 +505,6 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			connected.Store(false)
 			connectedAt.Store(0)
 			log.Println("reconnect requested")
-			if networkTriggered.Swap(false) {
-				isNetworkReconnect = true
-				backoff = 200 * time.Millisecond // micro-delay lets new network's routing stabilize
-				networkGraceAttempts = networkGraceMax
-			} else {
-				backoff = minBackoff
-			}
 		case <-ctx.Done():
 			connected.Store(false)
 			connectedAt.Store(0)
@@ -582,33 +516,13 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			return nil
 		}
 
-		// Reset DNS connections on network change so stale sockets are discarded
-		if isNetworkReconnect && dns != nil {
+		// Reset DNS connections so stale sockets are discarded
+		if dns != nil {
 			dns.resetConnections()
 		}
 
-		if backoff > 0 {
-			sleepCtx(ctx, backoff)
-		}
-		if networkGraceAttempts > 0 {
-			networkGraceAttempts--
-			backoff = minBackoff // hold at minBackoff during grace period
-		} else {
-			backoff = nextBackoff(backoff, maxBackoff)
-		}
+		sleepCtx(ctx, reconnectDelay)
 	}
-}
-
-// nextBackoff doubles the current backoff, capped at max, with 0–25% random jitter.
-func nextBackoff(current, max time.Duration) time.Duration {
-	next := current * 2
-	if next > max {
-		next = max
-	}
-	if quarter := int64(next) / 4; quarter > 0 {
-		next += time.Duration(mrand.Int64N(quarter))
-	}
-	return next
 }
 
 // connectHappyEyeballs implements Happy Eyeballs v3 (RFC 8305 / draft-ietf-happy-happyeyeballs-v3)
