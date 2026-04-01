@@ -19,7 +19,7 @@
 
 ### Reconnect Delay
 
-- [ ] **RDLY-01**: Constant 1-second reconnect delay replaces exponential backoff with jitter
+- [x] **RDLY-01**: Constant 1-second reconnect delay replaces exponential backoff with jitter
 
 ## Future Requirements
 
@@ -61,7 +61,7 @@
 | CERR-02 | Phase 2 | Complete |
 | CERR-03 | Phase 2 | Complete |
 | CERR-04 | Phase 2 | Complete |
-| RDLY-01 | Phase 2 | Pending |
+| RDLY-01 | Phase 2 | Complete |
 
 **Coverage:**
 - v1.1 requirements: 7 total

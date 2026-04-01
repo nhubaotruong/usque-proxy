@@ -45,7 +45,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 Plans:
 - [x] 02-01-PLAN.md — Add CloseError classification to forwardUp and forwardDown
-- [ ] 02-02-PLAN.md — Replace backoff with constant delay, fix QUIC config, cleanup dead code, build AAR
+- [x] 02-02-PLAN.md — Replace backoff with constant delay, fix QUIC config, cleanup dead code, build AAR
 
 ## Progress
 
