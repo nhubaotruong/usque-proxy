@@ -27,11 +27,11 @@ Decimal phases appear between their surrounding integers in numeric order.
   2. After a tunnel death, the app reconnects with a constant 1-second delay and retries indefinitely until successful
   3. Each reconnect cycle starts clean with no leaked connections, transports, or goroutines from the previous attempt
   4. Individual packet read/write errors on the TUN device do not cause unnecessary reconnections
-**Plans**: TBD
+**Plans:** 2 plans
 
 Plans:
-- [ ] 01-01: TBD
-- [ ] 01-02: TBD
+- [ ] 01-01-PLAN.md — Rewrite forwarding loops with CloseError classification and simplify reconnect to constant 1s delay
+- [ ] 01-02-PLAN.md — Remove obsolete stats fields, dead code (nextBackoff, livenessCheck), and clean up Kotlin side
 
 ### Phase 2: Complexity Removal
 **Goal**: All obsolete monitoring and keepalive mechanisms are removed, leaving only the forwarding-loop-based detection
