@@ -22,27 +22,27 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Set up JDK 25
+      - name: Set up JDK 17
         uses: actions/setup-java@v5
         with:
-          java-version: '25'
+          java-version: '17'
           distribution: 'temurin'
 
-      - name: Set up Go 1.25.5
+      - name: Set up Go 1.24.2
         uses: actions/setup-go@v6
         with:
-          go-version: '1.25.5'
+          go-version: '1.24.2'
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
       - name: Install SDK packages
-        run: sdkmanager "platforms;android-36" "platforms;android-31" "build-tools;36.0.0" "ndk;30.0.14904198"
+        run: sdkmanager "platforms;android-36" "platforms;android-31" "build-tools;36.0.0" "ndk;28.0.13004108"
 
       - name: Install gomobile
         run: |
-          go install golang.org/x/mobile/cmd/gomobile
-          go install golang.org/x/mobile/cmd/gobind
+          go install golang.org/x/mobile/cmd/gomobile@v0.0.0-20250408133729-978277e7eaf7
+          go install golang.org/x/mobile/cmd/gobind@v0.0.0-20250408133729-978277e7eaf7
 
       - name: Build usque AAR
         run: bash build-usque.sh

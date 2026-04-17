@@ -193,9 +193,11 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 				}
 				// Protect the socket from VPN routing
 				if tc, ok := conn.(*net.TCPConn); ok {
-					if err := protectTCPConn(tc, protector); err != nil {
-						conn.Close()
-						return nil, err
+					raw, err := tc.SyscallConn()
+					if err == nil {
+						raw.Control(func(fd uintptr) {
+							protector.ProtectFd(int(fd))
+						})
 					}
 				}
 				return conn, nil

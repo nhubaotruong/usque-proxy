@@ -27,20 +27,36 @@ import (
 	"github.com/Diniboy1123/usque/api"
 	"github.com/Diniboy1123/usque/config"
 	"github.com/Diniboy1123/usque/models"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
 	"github.com/yosida95/uritemplate/v3"
-	"golang.org/x/net/http2"
 )
 
 const (
-	defaultSNI           = "consumer-masque.cloudflareclient.com"
-	ZeroTrustSNI         = "zt-masque.cloudflareclient.com"
-	defaultURI           = "https://cloudflareaccess.com"
-	defaultLocale        = "en_US"
-	defaultEndpointH2V4  = "162.159.198.2"
+	defaultSNI    = "consumer-masque.cloudflareclient.com"
+	ZeroTrustSNI  = "zt-masque.cloudflareclient.com"
+	defaultURI    = "https://cloudflareaccess.com"
+	defaultLocale = "en_US"
 )
 
-// tlsSessionCache enables TLS session resumption across reconnects.
-var tlsSessionCache = tls.NewLRUClientSessionCache(8)
+// quicSessionCache enables TLS session resumption across QUIC reconnects (1-RTT, not 0-RTT).
+var quicSessionCache = tls.NewLRUClientSessionCache(8)
+
+// taggedEndpoint pairs a resolved UDP address with a label for logging.
+type taggedEndpoint struct {
+	addr *net.UDPAddr
+	tag  string
+}
+
+// connResult holds the outcome of a single tunnel connection attempt.
+type connResult struct {
+	udpConn *net.UDPConn
+	tr      *http3.Transport
+	ipConn  *connectip.Conn
+	rsp     *http.Response
+	err     error
+	tag     string
+}
 
 // tunnelConfig extends config.Config with optional tunnel parameters.
 type tunnelConfig struct {
@@ -65,13 +81,6 @@ func (t *tunnelConfig) connectUri() string {
 		return t.ConnectURI
 	}
 	return defaultURI
-}
-
-func (t *tunnelConfig) endpointH2V4() string {
-	if t.Config.EndpointH2V4 != "" {
-		return t.Config.EndpointH2V4
-	}
-	return defaultEndpointH2V4
 }
 
 // VpnProtector is implemented by Android's VpnService to protect sockets
@@ -407,15 +416,6 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		log.Println("DNS tunnel cache enabled")
 	}
 
-	// HTTP/2 (TCP) mode for better reliability on mobile networks.
-	h2v4 := cfg.endpointH2V4()
-	ip := net.ParseIP(h2v4)
-	if ip == nil {
-		return fmt.Errorf("invalid H2 endpoint: %s", h2v4)
-	}
-	h2Endpoint := &net.TCPAddr{IP: ip, Port: connectPort}
-	log.Printf("HTTP/2 mode: endpoint %s", h2Endpoint)
-
 	// Certificate cache: generate once, reuse until near expiry.
 	var cachedCert [][]byte
 	var certExpiry time.Time
@@ -440,7 +440,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			certExpiry = time.Now().Add(24 * time.Hour)
 		}
 
-		tlsCfg, err := api.PrepareTlsConfig(privKey, peerPubKey, cachedCert, cfg.sni(), false)
+		tlsCfg, err := api.PrepareTlsConfig(privKey, peerPubKey, cachedCert, cfg.sni())
 		if err != nil {
 			lastError.Store(err.Error())
 			log.Printf("TLS config: %v", err)
@@ -448,15 +448,26 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			continue
 		}
 
-		tlsCfg.ClientSessionCache = tlsSessionCache
+		tlsCfg.ClientSessionCache = quicSessionCache // 1-RTT session resumption (not 0-RTT)
+
+		quicCfg := &quic.Config{
+			EnableDatagrams:         true,
+			InitialPacketSize:       1280,
+			KeepAlivePeriod:         30 * time.Second,
+			MaxIdleTimeout:          120 * time.Second,
+			DisablePathMTUDiscovery: true,
+		}
 
 		connectCount.Add(1)
-		h2Client, ipConn, rsp, err := connectTunnelProtectedH2(
-			ctx, tlsCfg, h2Endpoint, cfg.connectUri(), protector,
+		udpConn, tr, ipConn, rsp, err := connectHappyEyeballs(
+			ctx, tlsCfg, quicCfg,
+			cfg.EndpointV4, cfg.EndpointV6,
+			connectPort, cfg.connectUri(), protector,
 		)
 		if err != nil {
 			lastError.Store(err.Error())
 			log.Printf("connect: %v", err)
+			// If no network, wait for SetConnectivity(true) instead of hammering
 			if !hasNetwork.Load() {
 				log.Println("no network — waiting for connectivity")
 				waitForNetwork(ctx)
@@ -468,7 +479,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		if rsp.StatusCode != 200 {
 			lastError.Store(fmt.Sprintf("tunnel rejected: %s", rsp.Status))
 			log.Printf("tunnel rejected: %s", rsp.Status)
-			cleanup(ipConn, h2Client)
+			cleanup(ipConn, udpConn, tr)
 			sleepCtx(ctx, reconnectDelay)
 			continue
 		}
@@ -499,7 +510,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 			connectedAt.Store(0)
 		}
 
-		cleanup(ipConn, h2Client)
+		cleanup(ipConn, udpConn, tr)
 		wg.Wait() // wait for forwarding goroutines to exit before reconnecting
 		if ctx.Err() != nil {
 			return nil
@@ -514,76 +525,164 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	}
 }
 
-// connectTunnelProtectedH2 establishes a MASQUE tunnel over HTTP/2 (TCP).
-// Returns the http.Client for cleanup (caller must call CloseIdleConnections on disconnect).
-func connectTunnelProtectedH2(
+// connectHappyEyeballs implements Happy Eyeballs v3 (RFC 8305 / draft-ietf-happy-happyeyeballs-v3)
+// for the QUIC/Connect-IP tunnel connection. It races IPv6 and IPv4 with a
+// 250ms staggered delay, preferring IPv6 per the spec.
+func connectHappyEyeballs(
 	ctx context.Context,
 	tlsConfig *tls.Config,
-	endpoint *net.TCPAddr,
+	quicConfig *quic.Config,
+	endpointV4, endpointV6 string,
+	connectPort int,
 	connectUri string,
 	protector VpnProtector,
-) (*http.Client, *connectip.Conn, *http.Response, error) {
-	h2TlsConfig := tlsConfig.Clone()
-	h2TlsConfig.NextProtos = []string{"h2"}
+) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
+	const connectionAttemptDelay = 150 * time.Millisecond
 
-	transport := &http2.Transport{
-		DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
-			dialer := &net.Dialer{Timeout: 10 * time.Second}
-			conn, err := dialer.DialContext(ctx, network, endpoint.String())
-			if err != nil {
-				return nil, err
-			}
-			// Protect TCP socket from VPN routing
-			if tc, ok := conn.(*net.TCPConn); ok {
-				if err := protectTCPConn(tc, protector); err != nil {
-					conn.Close()
-					return nil, err
-				}
-			}
-			tlsConn := tls.Client(conn, h2TlsConfig)
-			if err := tlsConn.HandshakeContext(ctx); err != nil {
-				tlsConn.Close()
-				return nil, err
-			}
-			return tlsConn, nil
-		},
+	// Build ordered endpoint list: IPv6 first, then IPv4.
+	var endpoints []taggedEndpoint
+	if ip := net.ParseIP(endpointV6); ip != nil {
+		endpoints = append(endpoints, taggedEndpoint{&net.UDPAddr{IP: ip, Port: connectPort}, "IPv6"})
+	}
+	if ip := net.ParseIP(endpointV4); ip != nil {
+		endpoints = append(endpoints, taggedEndpoint{&net.UDPAddr{IP: ip, Port: connectPort}, "IPv4"})
 	}
 
-	client := &http.Client{Transport: transport}
-	template := uritemplate.MustNew(connectUri)
-	headers := http.Header{
-		"User-Agent":       {""},
-		"cf-connect-proto": {"cf-connect-ip"},
-		"pq-enabled":       {"false"},
+	if len(endpoints) == 0 {
+		return nil, nil, nil, nil, errors.New("no valid endpoints configured")
 	}
 
-	ipConn, rsp, err := connectip.DialH2(ctx, client, template, headers)
-	if err != nil {
-		client.CloseIdleConnections()
-		if strings.Contains(err.Error(), "tls: access denied") {
-			return nil, nil, nil, errors.New("login failed! Please double-check if your tls key and cert is enrolled in the Cloudflare Access service")
+	// Single endpoint — no racing needed.
+	if len(endpoints) == 1 {
+		ep := endpoints[0]
+		log.Printf("Connecting to %s (%s)", ep.addr, ep.tag)
+		udpConn, tr, ipConn, rsp, err := connectTunnelProtected(ctx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
+		if err != nil {
+			if udpConn != nil {
+				udpConn.Close()
+			}
+			return nil, nil, nil, nil, err
 		}
-		return nil, nil, nil, fmt.Errorf("connect-ip h2: %v", err)
+		return udpConn, tr, ipConn, rsp, nil
 	}
-	return client, ipConn, rsp, nil
+
+	// Dual-stack: race with staggered start.
+	raceCtx, raceCancel := context.WithCancel(ctx)
+	defer raceCancel()
+
+	ch := make(chan connResult, 2)
+
+	attempt := func(ep taggedEndpoint) {
+		log.Printf("Connecting to %s (%s)", ep.addr, ep.tag)
+		udpConn, tr, ipConn, rsp, err := connectTunnelProtected(raceCtx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
+		r := connResult{udpConn: udpConn, tr: tr, ipConn: ipConn, rsp: rsp, err: err, tag: ep.tag}
+		// Treat non-200 as failure for racing purposes.
+		if err == nil && rsp.StatusCode != 200 {
+			r.err = fmt.Errorf("tunnel rejected: %s", rsp.Status)
+		}
+		ch <- r
+	}
+
+	// Start first attempt (IPv6) immediately.
+	go attempt(endpoints[0])
+
+	// Wait for delay or first failure before starting second attempt.
+	timer := time.NewTimer(connectionAttemptDelay)
+	defer timer.Stop()
+
+	remaining := 0
+	select {
+	case r := <-ch:
+		if r.err == nil {
+			// First attempt won — no need to start second.
+			return r.udpConn, r.tr, r.ipConn, r.rsp, nil
+		}
+		// First attempt failed — start fallback immediately.
+		log.Printf("%s failed: %v", r.tag, r.err)
+		if r.udpConn != nil {
+			r.udpConn.Close()
+		}
+		go attempt(endpoints[1])
+		remaining = 1 // only the fallback is in flight
+	case <-timer.C:
+		// Delay expired — start second attempt in parallel.
+		go attempt(endpoints[1])
+		remaining = 2 // both attempts in flight
+	case <-ctx.Done():
+		return nil, nil, nil, nil, ctx.Err()
+	}
+
+	// Collect results from in-flight attempts.
+	var lastErr error
+	for i := 0; i < remaining; i++ {
+		select {
+		case r := <-ch:
+			if r.err == nil {
+				// Winner — cancel the other attempt and return.
+				raceCancel()
+				return r.udpConn, r.tr, r.ipConn, r.rsp, nil
+			}
+			log.Printf("%s failed: %v", r.tag, r.err)
+			if r.udpConn != nil {
+				r.udpConn.Close()
+			}
+			lastErr = r.err
+		case <-ctx.Done():
+			return nil, nil, nil, nil, ctx.Err()
+		}
+	}
+	return nil, nil, nil, nil, lastErr
 }
 
-// protectTCPConn marks a TCP socket as protected from VPN routing.
-func protectTCPConn(conn *net.TCPConn, protector VpnProtector) error {
-	rawConn, err := conn.SyscallConn()
+// connectTunnelProtected mirrors api.ConnectTunnel but protects the UDP
+// socket fd before QUIC handshake to prevent VPN routing loops.
+func connectTunnelProtected(
+	ctx context.Context,
+	tlsConfig *tls.Config,
+	quicConfig *quic.Config,
+	endpoint *net.UDPAddr,
+	connectUri string,
+	protector VpnProtector,
+) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
+	// Create UDP socket
+	listenAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
+	if endpoint.IP.To4() == nil {
+		listenAddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
+	}
+	udpConn, err := net.ListenUDP("udp", listenAddr)
 	if err != nil {
-		return fmt.Errorf("raw conn: %w", err)
+		return nil, nil, nil, nil, fmt.Errorf("UDP socket: %w", err)
 	}
-	var protectErr error
-	ctrlErr := rawConn.Control(func(fd uintptr) {
-		if !protector.ProtectFd(int(fd)) {
-			protectErr = errors.New("VPN protect() failed")
-		}
-	})
-	if ctrlErr != nil {
-		return fmt.Errorf("control: %w", ctrlErr)
+
+	// Protect before QUIC handshake
+	if err := protectUDPConn(udpConn, protector); err != nil {
+		udpConn.Close()
+		return nil, nil, nil, nil, err
 	}
-	return protectErr
+
+	// QUIC + Connect-IP (mirrors api.ConnectTunnel logic)
+	conn, err := quic.Dial(ctx, udpConn, endpoint, tlsConfig, quicConfig)
+	if err != nil {
+		udpConn.Close()
+		return nil, nil, nil, nil, err
+	}
+
+	tr := &http3.Transport{
+		EnableDatagrams:    true,
+		AdditionalSettings: map[uint64]uint64{0x276: 1},
+		DisableCompression: true,
+	}
+	hconn := tr.NewClientConn(conn)
+	template := uritemplate.MustNew(connectUri)
+	headers := http.Header{"User-Agent": {""}}
+
+	ipConn, rsp, err := connectip.Dial(ctx, hconn, template, "cf-connect-ip", headers, true)
+	if err != nil {
+		tr.Close()
+		udpConn.Close()
+		return nil, nil, nil, nil, fmt.Errorf("connect-ip: %v", err)
+	}
+	return udpConn, tr, ipConn, rsp, nil
 }
 
 func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor, dnsCache *tunnelDnsCache) {
@@ -617,17 +716,24 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 			}
 		}
 
-		// Send via Connect-IP (stream frames over HTTP/2)
+		// Send via Connect-IP datagrams (UDP, ICMP, TCP, etc.)
 		icmp, err := ipConn.WritePacket(pkt)
 		pool.Put(buf)
 		if err != nil {
-			errChan <- fmt.Errorf("connection closed while writing to IP connection: %v", err)
-			return
+			if errors.As(err, new(*connectip.CloseError)) {
+				errChan <- fmt.Errorf("connection closed while writing to IP connection: %v", err)
+				return
+			}
+			log.Printf("Error writing to IP connection: %v, continuing...", err)
+			continue
 		}
 		if len(icmp) > 0 {
 			if err := device.WritePacket(icmp); err != nil {
-				errChan <- fmt.Errorf("connection closed while writing ICMP to TUN device: %v", err)
-				return
+				if errors.As(err, new(*connectip.CloseError)) {
+					errChan <- fmt.Errorf("connection closed while writing ICMP to TUN device: %v", err)
+					return
+				}
+				log.Printf("Error writing ICMP to TUN device: %v, continuing...", err)
 			}
 		}
 	}
@@ -639,8 +745,12 @@ func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetB
 	for {
 		n, err := ipConn.ReadPacket(buf, true)
 		if err != nil {
-			errChan <- fmt.Errorf("connection closed while reading from IP connection: %v", err)
-			return
+			if errors.As(err, new(*connectip.CloseError)) {
+				errChan <- fmt.Errorf("connection closed while reading from IP connection: %v", err)
+				return
+			}
+			log.Printf("Error reading from IP connection: %v, continuing...", err)
+			continue
 		}
 		rxBytes.Add(int64(n))
 		if dnsCache != nil {
@@ -669,12 +779,15 @@ func selfSignedCert(privKey *ecdsa.PrivateKey) ([][]byte, error) {
 	return [][]byte{der}, nil
 }
 
-func cleanup(ipConn *connectip.Conn, h2Client *http.Client) {
+func cleanup(ipConn *connectip.Conn, udpConn *net.UDPConn, tr *http3.Transport) {
 	if ipConn != nil {
 		ipConn.Close()
 	}
-	if h2Client != nil {
-		h2Client.CloseIdleConnections()
+	if udpConn != nil {
+		udpConn.Close()
+	}
+	if tr != nil {
+		tr.Close()
 	}
 }
 
@@ -685,14 +798,11 @@ func protectUDPConn(conn *net.UDPConn, protector VpnProtector) error {
 		return fmt.Errorf("raw conn: %w", err)
 	}
 	var protectErr error
-	ctrlErr := rawConn.Control(func(fd uintptr) {
+	rawConn.Control(func(fd uintptr) {
 		if !protector.ProtectFd(int(fd)) {
 			protectErr = errors.New("VPN protect() failed")
 		}
 	})
-	if ctrlErr != nil {
-		return fmt.Errorf("control: %w", ctrlErr)
-	}
 	return protectErr
 }
 
