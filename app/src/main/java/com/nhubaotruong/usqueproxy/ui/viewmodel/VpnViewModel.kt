@@ -93,8 +93,8 @@ class VpnViewModel(application: Application) : AndroidViewModel(application) {
     fun clearTunnelError() { _tunnelError.value = null }
 
     companion object {
-        const val STATE_POLL_INTERVAL = 5_000L
-        const val STATS_POLL_INTERVAL = 10_000L
+        const val STATE_POLL_INTERVAL = 1_000L
+        const val STATS_POLL_INTERVAL = 2_000L
     }
 
     /** Called from composable LaunchedEffect — checks volatile booleans, no JNI. */

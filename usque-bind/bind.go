@@ -122,6 +122,7 @@ var (
 	connected   atomic.Bool  // true when MASQUE tunnel is forwarding traffic
 	done        chan struct{} // closed when maintainTunnel returns
 	reconnectCh chan struct{}
+	networkCh   chan struct{} // signaled by SetConnectivity(true) to wake waitForNetwork
 	startTime   time.Time
 	connectedAt atomic.Int64 // unix millis when last connected (0 if not connected)
 	txBytes     atomic.Int64
@@ -165,6 +166,7 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector) error {
 	cancel = c
 	done = make(chan struct{})
 	reconnectCh = make(chan struct{}, 1)
+	networkCh = make(chan struct{}, 1)
 	running.Store(true)
 	connected.Store(false)
 	hasNetwork.Store(true)
@@ -201,6 +203,11 @@ func StopTunnel() {
 func SetConnectivity(networkAvailable bool) {
 	wasConnected := hasNetwork.Swap(networkAvailable)
 	if networkAvailable && !wasConnected {
+		// Wake waitForNetwork immediately (no polling needed)
+		select {
+		case networkCh <- struct{}{}:
+		default:
+		}
 		// Network restored — trigger reconnect to pick up the new network
 		Reconnect()
 	}
@@ -959,20 +966,20 @@ func protectUDPConn(conn *net.UDPConn, protector VpnProtector) error {
 }
 
 // waitForNetwork blocks until hasNetwork becomes true or ctx is cancelled.
-// Polls every 500ms — SetConnectivity(true) also triggers Reconnect() which
-// will wake the select in maintainTunnel if we're past the connection phase.
+// Uses channel-based wakeup from SetConnectivity — no polling, zero CPU when idle.
 func waitForNetwork(ctx context.Context) {
-	ticker := time.NewTicker(500 * time.Millisecond)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if hasNetwork.Load() {
-				return
-			}
-		}
+	// Drain any stale signal from a previous SetConnectivity(true) that was
+	// buffered while connected — prevents instant false return.
+	select {
+	case <-networkCh:
+	default:
+	}
+	if hasNetwork.Load() {
+		return
+	}
+	select {
+	case <-ctx.Done():
+	case <-networkCh:
 	}
 }
 

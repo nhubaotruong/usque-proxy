@@ -43,6 +43,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.yield
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONArray
@@ -165,78 +166,8 @@ class UsqueVpnService : VpnService() {
             .apply { setReferenceCounted(false) }
     }
 
-    private val reconnectHandler = Handler(Looper.getMainLooper())
-    private val reconnectRunnable = Runnable {
-        if (isRunning && !isDeviceIdle) {
-            reconnectWakeLock.acquire(30_000L) // 30s max for reconnect handshake
-            try {
-                Usquebind.reconnect()
-            } finally {
-                if (reconnectWakeLock.isHeld) reconnectWakeLock.release()
-            }
-        }
-    }
-    private val watchdogRunnable = object : Runnable {
-        override fun run() {
-            if (!isRunning) return
-            runCatching {
-                // getStats() is a JNI call that reads atomics — should be fast,
-                // but add a safety timeout to prevent blocking the main handler.
-                val statsJson = java.util.concurrent.FutureTask<String> { Usquebind.getStats() }
-                    .also { Thread(it, "usque-stats").start() }
-                    .runCatching { get(2, java.util.concurrent.TimeUnit.SECONDS) }
-                    .getOrNull() ?: return@runCatching
-                val stats = JSONObject(statsJson)
-                val goConnected = stats.optBoolean("connected", false)
-                val goRunning = stats.optBoolean("running", false)
-                val rxTx = stats.optLong("rx_bytes", 0) + stats.optLong("tx_bytes", 0)
-                val goHasNetwork = stats.optBoolean("has_network", true)
-                val lastErr = stats.optString("last_error", "")
-
-                // Surface Go-side errors to the UI, but only after a grace period
-                // to suppress transient errors during normal reconnect cycles.
-                // Like ProtonVPN's "fail countdown" — wait for ERROR_GRACE_TICKS
-                // consecutive error ticks before surfacing to avoid UI flicker.
-                if (goConnected) {
-                    errorGraceCount = 0
-                    lastSurfacedError = ""
-                    updateNotification("VPN is active")
-                } else if (lastErr.isNotEmpty() && goRunning) {
-                    errorGraceCount++
-                    if (errorGraceCount >= ERROR_GRACE_TICKS && lastErr != lastSurfacedError) {
-                        lastError = lastErr
-                        lastSurfacedError = lastErr
-                        _events.tryEmit(VpnServiceEvent.Error(lastErr))
-                    }
-                    if (!goHasNetwork) {
-                        updateNotification("Waiting for network...")
-                    } else {
-                        updateNotification("Reconnecting...")
-                    }
-                } else if (goRunning && !goHasNetwork) {
-                    errorGraceCount = 0
-                    updateNotification("Waiting for network...")
-                } else if (goRunning) {
-                    errorGraceCount = 0
-                    updateNotification("Reconnecting...")
-                }
-
-                // Stuck detection: tunnel says connected but no traffic for 2+ intervals
-                if (goConnected && rxTx > 0L && rxTx == lastWatchdogRxTx) {
-                    watchdogStallCount++
-                    if (watchdogStallCount >= 3) { // 3 intervals = ~3 min stall
-                        Log.w(TAG, "Stuck connection detected (no traffic for ${watchdogStallCount * WATCHDOG_INTERVAL_MS / 1000}s), triggering reconnect")
-                        Usquebind.reconnect()
-                        watchdogStallCount = 0
-                    }
-                } else {
-                    watchdogStallCount = 0
-                }
-                lastWatchdogRxTx = rxTx
-            }
-            reconnectHandler.postDelayed(this, WATCHDOG_INTERVAL_MS)
-        }
-    }
+    private var watchdogJob: Job? = null
+    private var reconnectDebounceJob: Job? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -504,12 +435,64 @@ class UsqueVpnService : VpnService() {
     private fun startWatchdog() {
         lastWatchdogRxTx = 0L
         watchdogStallCount = 0
-        reconnectHandler.removeCallbacks(watchdogRunnable)
-        reconnectHandler.postDelayed(watchdogRunnable, WATCHDOG_INTERVAL_MS)
+        watchdogJob?.cancel()
+        watchdogJob = serviceScope.launch {
+            while (true) {
+                val interval = if (isPowerSaveMode) WATCHDOG_INTERVAL_MS * 2 else WATCHDOG_INTERVAL_MS
+                delay(interval)
+                if (!isRunning) break
+                runCatching {
+                    val statsJson = withContext(Dispatchers.IO) { Usquebind.getStats() }
+                    val stats = JSONObject(statsJson)
+                    val goConnected = stats.optBoolean("connected", false)
+                    val goRunning = stats.optBoolean("running", false)
+                    val rxTx = stats.optLong("rx_bytes", 0) + stats.optLong("tx_bytes", 0)
+                    val goHasNetwork = stats.optBoolean("has_network", true)
+                    val lastErr = stats.optString("last_error", "")
+
+                    if (goConnected) {
+                        errorGraceCount = 0
+                        lastSurfacedError = ""
+                        updateNotification("VPN is active")
+                    } else if (lastErr.isNotEmpty() && goRunning) {
+                        errorGraceCount++
+                        if (errorGraceCount >= ERROR_GRACE_TICKS && lastErr != lastSurfacedError) {
+                            lastError = lastErr
+                            lastSurfacedError = lastErr
+                            _events.tryEmit(VpnServiceEvent.Error(lastErr))
+                        }
+                        if (!goHasNetwork) {
+                            updateNotification("Waiting for network...")
+                        } else {
+                            updateNotification("Reconnecting...")
+                        }
+                    } else if (goRunning && !goHasNetwork) {
+                        errorGraceCount = 0
+                        updateNotification("Waiting for network...")
+                    } else if (goRunning) {
+                        errorGraceCount = 0
+                        updateNotification("Reconnecting...")
+                    }
+
+                    if (goConnected && rxTx > 0L && rxTx == lastWatchdogRxTx) {
+                        watchdogStallCount++
+                        if (watchdogStallCount >= 3) {
+                            Log.w(TAG, "Stuck connection detected (no traffic for ${watchdogStallCount * interval / 1000}s), triggering reconnect")
+                            withContext(Dispatchers.IO) { Usquebind.reconnect() }
+                            watchdogStallCount = 0
+                        }
+                    } else {
+                        watchdogStallCount = 0
+                    }
+                    lastWatchdogRxTx = rxTx
+                }
+            }
+        }
     }
 
     private fun stopWatchdog() {
-        reconnectHandler.removeCallbacks(watchdogRunnable)
+        watchdogJob?.cancel()
+        watchdogJob = null
     }
 
     /**
@@ -610,8 +593,18 @@ class UsqueVpnService : VpnService() {
 
     private fun restartTunnel() {
         // Debounce rapid network changes (WiFi↔cellular) into a single reconnect.
-        reconnectHandler.removeCallbacks(reconnectRunnable)
-        reconnectHandler.postDelayed(reconnectRunnable, 500L)
+        reconnectDebounceJob?.cancel()
+        reconnectDebounceJob = serviceScope.launch {
+            delay(500L)
+            if (isRunning && !isDeviceIdle) {
+                reconnectWakeLock.acquire(10_000L) // 10s max for reconnect handshake
+                try {
+                    withContext(Dispatchers.IO) { Usquebind.reconnect() }
+                } finally {
+                    if (reconnectWakeLock.isHeld) reconnectWakeLock.release()
+                }
+            }
+        }
     }
 
     /**
@@ -628,7 +621,7 @@ class UsqueVpnService : VpnService() {
         try {
         _events.tryEmit(VpnServiceEvent.Disconnecting)
         updateNotification("Disconnecting...")
-        reconnectHandler.removeCallbacks(reconnectRunnable)
+        reconnectDebounceJob?.cancel()
         stopWatchdog()
         unregisterNetworkCallback()
         Usquebind.stopTunnel()
@@ -655,7 +648,7 @@ class UsqueVpnService : VpnService() {
     }
 
     override fun onDestroy() {
-        reconnectHandler.removeCallbacks(reconnectRunnable)
+        reconnectDebounceJob?.cancel()
         stopWatchdog()
         runCatching { unregisterReceiver(idleModeReceiver) }
         // Synchronous cleanup: stop tunnel and cancel scope
@@ -669,7 +662,7 @@ class UsqueVpnService : VpnService() {
     override fun onRevoke() {
         Log.i(TAG, "VPN permission revoked")
         // Synchronous cleanup — onRevoke may be followed immediately by onDestroy
-        reconnectHandler.removeCallbacks(reconnectRunnable)
+        reconnectDebounceJob?.cancel()
         stopWatchdog()
         unregisterNetworkCallback()
         Usquebind.stopTunnel()
