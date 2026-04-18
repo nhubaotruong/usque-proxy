@@ -13,6 +13,7 @@ import android.net.IpPrefix
 import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.net.VpnService
 import android.os.Handler
 import android.os.Looper
@@ -694,11 +695,25 @@ class UsqueVpnService : VpnService() {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val dynamicExclusions = mutableListOf<IpPrefix>()
 
-        // Discover actual local network subnets from all non-VPN, non-cellular networks
+        // Discover actual local network subnets from all non-VPN networks
+        // using NetworkCallback (allNetworks is deprecated since API 31)
         runCatching {
-            for (network in cm.allNetworks) {
-                val caps = cm.getNetworkCapabilities(network) ?: continue
-                if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) continue
+            val discoveredNetworks = java.util.concurrent.ConcurrentLinkedQueue<Network>()
+            val latch = java.util.concurrent.CountDownLatch(1)
+            val request = NetworkRequest.Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .build()
+            val cb = object : ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: Network) {
+                    discoveredNetworks.add(network)
+                }
+            }
+            cm.registerNetworkCallback(request, cb)
+            // Brief wait for callbacks to fire for already-connected networks
+            latch.await(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+            runCatching { cm.unregisterNetworkCallback(cb) }
+
+            for (network in discoveredNetworks) {
                 val lp = cm.getLinkProperties(network) ?: continue
                 for (la in lp.linkAddresses) {
                     val addr = la.address
