@@ -276,10 +276,15 @@ class UsqueVpnService : VpnService() {
             builder.addAddress(it, 128)
         }
 
-        // Detect Android Private DNS (DNS-over-TLS) — when active, the system resolves
-        // DNS directly via its Private DNS provider, potentially bypassing our tunnel DNS.
-        // Log it so the user understands DNS behavior, and pass the flag to Go.
-        val privateDnsActive = isPrivateDnsActive()
+        // Read the underlying network's LinkProperties once and derive both Private DNS
+        // status and system DNS servers from the same snapshot. Two separate callbacks
+        // could race against Private DNS bootstrap and produce inconsistent state, which
+        // left tunnel DNS broken until the user toggled Private DNS off and on again.
+        val cmEarly = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+        val underlyingLp = underlyingLinkProperties(cmEarly)
+        val privateDnsActive = underlyingLp?.let {
+            it.isPrivateDnsActive && it.privateDnsServerName != null
+        } ?: false
         if (privateDnsActive) {
             Log.i(TAG, "Android Private DNS is active — system DNS queries may bypass tunnel DNS interception")
             config.put("private_dns_active", true)
@@ -288,7 +293,7 @@ class UsqueVpnService : VpnService() {
         // DNS
         when (prefs.dnsMode) {
             DnsMode.SYSTEM -> {
-                val dns = getSystemDnsServers()
+                val dns = systemDnsServersFrom(underlyingLp)
                 Log.d(TAG, "Using system DNS (protected forwarding): $dns")
                 // Pass system DNS servers to Go for protected socket forwarding
                 config.put("system_dns", JSONArray(dns))
@@ -750,43 +755,45 @@ class UsqueVpnService : VpnService() {
         return false
     }
 
-    private fun isPrivateDnsActive(): Boolean = try {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val lp = underlyingLinkProperties(cm) ?: return false
-        lp.isPrivateDnsActive && lp.privateDnsServerName != null
-    } catch (_: Exception) {
-        false
-    }
-
     /**
      * Returns LinkProperties of the underlying (non-VPN) default network.
-     * Avoids reading the VPN's own LinkProperties when the service is
-     * restarted while the tunnel is still up. Uses a short-lived
-     * NetworkCallback (NOT_VPN + INTERNET) instead of the deprecated
-     * ConnectivityManager.allNetworks.
+     *
+     * Uses a short-lived NetworkCallback subscribing to onLinkPropertiesChanged
+     * (NOT onAvailable + getLinkProperties): onLinkPropertiesChanged fires
+     * synchronously at registration time with the network's CURRENT LP, so we
+     * avoid a race where onAvailable arrives but getLinkProperties returns
+     * stale/empty data while Private DNS (DoT) is still bootstrapping. That race
+     * caused tunnel DNS to break on startup whenever Private DNS was active —
+     * users had to toggle Private DNS off and on to recover.
+     *
+     * Also avoids reading ConnectivityManager.activeNetwork directly: when this
+     * service restarts while the tunnel is still up, activeNetwork points at
+     * the VPN itself and reports the VPN's own LinkProperties.
      */
     private fun underlyingLinkProperties(cm: ConnectivityManager): LinkProperties? {
-        val discovered = java.util.concurrent.ConcurrentLinkedQueue<Network>()
+        val result = java.util.concurrent.atomic.AtomicReference<LinkProperties?>(null)
         val latch = java.util.concurrent.CountDownLatch(1)
         val request = NetworkRequest.Builder()
             .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
             .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
             .build()
         val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                discovered.add(network)
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                if (result.compareAndSet(null, lp)) latch.countDown()
             }
         }
         runCatching {
             cm.registerNetworkCallback(request, cb)
-            latch.await(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+            latch.await(1, java.util.concurrent.TimeUnit.SECONDS)
         }
         runCatching { cm.unregisterNetworkCallback(cb) }
-        for (network in discovered) {
-            val lp = cm.getLinkProperties(network) ?: continue
-            return lp
-        }
-        return null
+        return result.get()
+    }
+
+    private fun systemDnsServersFrom(lp: LinkProperties?): List<String> {
+        if (lp == null) return listOf("1.1.1.1")
+        val servers = lp.dnsServers.map { it.hostAddress ?: "" }.filter { it.isNotEmpty() }
+        return servers.ifEmpty { listOf("1.1.1.1") }
     }
 
     private fun detectNetworkType(): String {
@@ -798,17 +805,6 @@ class UsqueVpnService : VpnService() {
             caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
             else -> ""
         }
-    }
-
-
-    private fun getSystemDnsServers(): List<String> = try {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val lp = underlyingLinkProperties(cm) ?: return listOf("1.1.1.1")
-        val servers = lp.dnsServers.map { it.hostAddress ?: "" }.filter { it.isNotEmpty() }
-        servers.ifEmpty { listOf("1.1.1.1") }
-    } catch (e: SecurityException) {
-        Log.w(TAG, "Cannot read system DNS, falling back to 1.1.1.1", e)
-        listOf("1.1.1.1")
     }
 
     private fun createNotificationChannel() {
