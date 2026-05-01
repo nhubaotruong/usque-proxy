@@ -752,11 +752,41 @@ class UsqueVpnService : VpnService() {
 
     private fun isPrivateDnsActive(): Boolean = try {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val network = cm.activeNetwork ?: return false
-        val lp = cm.getLinkProperties(network) ?: return false
+        val lp = underlyingLinkProperties(cm) ?: return false
         lp.isPrivateDnsActive && lp.privateDnsServerName != null
     } catch (_: Exception) {
         false
+    }
+
+    /**
+     * Returns LinkProperties of the underlying (non-VPN) default network.
+     * Avoids reading the VPN's own LinkProperties when the service is
+     * restarted while the tunnel is still up. Uses a short-lived
+     * NetworkCallback (NOT_VPN + INTERNET) instead of the deprecated
+     * ConnectivityManager.allNetworks.
+     */
+    private fun underlyingLinkProperties(cm: ConnectivityManager): LinkProperties? {
+        val discovered = java.util.concurrent.ConcurrentLinkedQueue<Network>()
+        val latch = java.util.concurrent.CountDownLatch(1)
+        val request = NetworkRequest.Builder()
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+            .build()
+        val cb = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                discovered.add(network)
+            }
+        }
+        runCatching {
+            cm.registerNetworkCallback(request, cb)
+            latch.await(100, java.util.concurrent.TimeUnit.MILLISECONDS)
+        }
+        runCatching { cm.unregisterNetworkCallback(cb) }
+        for (network in discovered) {
+            val lp = cm.getLinkProperties(network) ?: continue
+            return lp
+        }
+        return null
     }
 
     private fun detectNetworkType(): String {
@@ -773,8 +803,7 @@ class UsqueVpnService : VpnService() {
 
     private fun getSystemDnsServers(): List<String> = try {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val network = cm.activeNetwork ?: return listOf("1.1.1.1")
-        val lp = cm.getLinkProperties(network) ?: return listOf("1.1.1.1")
+        val lp = underlyingLinkProperties(cm) ?: return listOf("1.1.1.1")
         val servers = lp.dnsServers.map { it.hostAddress ?: "" }.filter { it.isNotEmpty() }
         servers.ifEmpty { listOf("1.1.1.1") }
     } catch (e: SecurityException) {
