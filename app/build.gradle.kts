@@ -5,10 +5,11 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
-val keystoreProperties = Properties().apply {
-    val file = rootProject.file("keystore.properties")
-    if (file.exists()) load(file.inputStream())
-}
+val keystoreProperties =
+    Properties().apply {
+        val file = rootProject.file("keystore.properties")
+        if (file.exists()) load(file.inputStream())
+    }
 
 android {
     namespace = "com.nhubaotruong.usqueproxy"
@@ -46,7 +47,7 @@ android {
             signingConfig = signingConfigs.getByName("release")
             proguardFiles(
                 getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
+                "proguard-rules.pro",
             )
         }
 
