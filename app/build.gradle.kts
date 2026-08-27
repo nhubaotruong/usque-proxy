@@ -13,17 +13,15 @@ val keystoreProperties = Properties().apply {
 android {
     namespace = "com.nhubaotruong.usqueproxy"
     compileSdk {
-        version = release(36) {
-            minorApiLevel = 1
-        }
+        version = release(37)
     }
 
     defaultConfig {
         applicationId = "com.nhubaotruong.usqueproxy"
         minSdk = 35
         targetSdk = 36
-        versionCode = 5
-        versionName = "1.45"
+        versionCode = 6
+        versionName = "1.46"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -51,6 +49,13 @@ android {
                 "proguard-rules.pro"
             )
         }
+
+        debug {
+            // x86_64 needed for emulator testing (host is x86_64); release stays arm64-only
+            ndk {
+                abiFilters += "x86_64"
+            }
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_21
@@ -60,6 +65,11 @@ android {
         compose = true
         buildConfig = true
     }
+}
+
+composeCompiler {
+    reportsDestination = layout.buildDirectory.dir("compose-reports")
+    metricsDestination = layout.buildDirectory.dir("compose-metrics")
 }
 
 repositories {
@@ -84,6 +94,7 @@ dependencies {
     implementation(libs.androidx.compose.material3.icons.extended)
     implementation(fileTree("libs") { include("*.aar") })
     testImplementation(libs.junit)
+    testImplementation(libs.org.json)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
     androidTestImplementation(platform(libs.androidx.compose.bom))

@@ -1,13 +1,7 @@
 package com.nhubaotruong.usqueproxy.vpn
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
 import android.net.ConnectivityManager
 import android.net.IpPrefix
 import android.net.LinkProperties
@@ -20,69 +14,39 @@ import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.os.PowerManager
 import android.util.Log
-import com.nhubaotruong.usqueproxy.MainActivity
-import com.nhubaotruong.usqueproxy.R
-import com.nhubaotruong.usqueproxy.data.Office365Endpoints
 import com.nhubaotruong.usqueproxy.data.DnsMode
-import com.nhubaotruong.usqueproxy.data.ProfileType
+import com.nhubaotruong.usqueproxy.data.Office365Endpoints
 import com.nhubaotruong.usqueproxy.data.SplitMode
 import com.nhubaotruong.usqueproxy.data.VpnPreferences
 import com.nhubaotruong.usqueproxy.data.VpnPrefs
 import com.nhubaotruong.usqueproxy.tile.VpnTileService
+import org.json.JSONObject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.flow.MutableSharedFlow
-import kotlinx.coroutines.flow.SharedFlow
-import kotlinx.coroutines.flow.asSharedFlow
-import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.yield
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import org.json.JSONArray
-import org.json.JSONObject
+import kotlinx.coroutines.yield
+import usquebind.TunnelListener
 import usquebind.Usquebind
 import usquebind.VpnProtector
 
-class UsqueVpnService : VpnService() {
-
+class UsqueVpnService : VpnService(), TunnelListener {
     companion object {
         const val TAG = "UsqueVpnService"
         const val ACTION_STOP = "com.nhubaotruong.usqueproxy.STOP_VPN"
         const val ACTION_RESTART = "com.nhubaotruong.usqueproxy.RESTART_VPN"
-        const val CHANNEL_ID = "vpn_channel"
-        const val NOTIFICATION_ID = 1
-        private const val WATCHDOG_INTERVAL_MS = 60_000L
-        private const val ERROR_GRACE_TICKS = 3 // suppress errors for 3 watchdog intervals (~3 min)
-
-        @Volatile
-        var isRunning = false
-            private set
-
-        @Volatile
-        var lastError: String? = null
-            private set
-
-        fun clearError() { lastError = null }
-
-        /** Event emitted on VPN state changes — ViewModel collects instead of polling. */
-        sealed interface VpnServiceEvent {
-            data object Connecting : VpnServiceEvent
-            data object Started : VpnServiceEvent
-            data object Stopped : VpnServiceEvent
-            data object Disconnecting : VpnServiceEvent
-            data class Error(val message: String) : VpnServiceEvent
-        }
-
-        private val _events = MutableSharedFlow<VpnServiceEvent>(replay = 1, extraBufferCapacity = 16)
-        val events: SharedFlow<VpnServiceEvent> = _events.asSharedFlow()
+        private const val DEAD_MANS_INTERVAL_MS = 15 * 60_000L
+        private const val DEAD_MANS_POWER_SAVE_MS = 60 * 60_000L
 
         // Pre-computed IpPrefix exclusions — avoids InetAddress.getByName() on every VPN start
         private val LOCAL_NETWORK_EXCLUSIONS_V4: List<Pair<java.net.InetAddress, Int>> by lazy {
@@ -113,75 +77,74 @@ class UsqueVpnService : VpnService() {
 
     private var vpnInterface: ParcelFileDescriptor? = null
     private var tunnelJob: Job? = null
-    private var networkCallback: ConnectivityManager.NetworkCallback? = null
     private var startJob: Job? = null
-    @Volatile
-    private var currentNetwork: Network? = null
-    @Volatile
-    private var underlyingNetworkSet = false
+    private var deadMansJob: Job? = null
+    private var reconnectDebounceJob: Job? = null
+
     @Volatile
     private var isDeviceIdle = false
-    private var lastWatchdogRxTx: Long = 0L
-    private var watchdogStallCount: Int = 0
-    private var errorGraceCount: Int = 0 // suppress transient errors during reconnect
-    private var lastSurfacedError: String = ""
+
+    @Volatile
+    private var powerSave = false
+
     @Volatile
     private var isManagedShutdown = false // true during stopVpnInternal, prevents self-stop in tunnelJob finally
-    @Volatile
-    private var isPowerSaveMode = false
 
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val lifecycleMutex = Mutex()
+
+    private val notification by lazy { VpnNotification(this) }
+    private val networkWatcher by lazy {
+        NetworkWatcher(
+            this,
+            onNetworkChanged = { available ->
+                if (TunnelStateHolder.isRunning) {
+                    serviceScope.launch {
+                        withContext(Dispatchers.IO) { Usquebind.setConnectivity(available) }
+                    }
+                }
+            },
+            onNetworkSwitched = {
+                if (TunnelStateHolder.isRunning && !isDeviceIdle) restartTunnel()
+            },
+            onUnderlyingNetworks = { networks ->
+                if (TunnelStateHolder.isRunning) setUnderlyingNetworks(networks)
+            },
+        )
+    }
+    private val powerStateWatcher by lazy {
+        PowerStateWatcher(
+            this,
+            onPowerSaveChanged = { saving ->
+                powerSave = saving
+                Log.i(TAG, "Power Save Mode: $saving")
+            },
+            onDeviceIdleChanged = { idle ->
+                val wasIdle = isDeviceIdle
+                isDeviceIdle = idle
+                if (wasIdle && !idle && TunnelStateHolder.isRunning) {
+                    Log.i(TAG, "Exiting Doze mode, triggering reconnect")
+                    restartTunnel()
+                }
+            },
+        )
+    }
 
     private val powerManager by lazy { getSystemService(Context.POWER_SERVICE) as PowerManager }
     private val connectWakeLock by lazy {
         powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UsqueProxy:connect")
             .apply { setReferenceCounted(false) }
     }
-
-    private val idleModeReceiver = object : BroadcastReceiver() {
-        override fun onReceive(context: Context, intent: Intent) {
-            when (intent.action) {
-                PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED -> {
-                    val idle = powerManager.isDeviceIdleMode
-                    val wasIdle = isDeviceIdle
-                    isDeviceIdle = idle
-                    if (wasIdle && !idle && isRunning) {
-                        Log.i(TAG, "Exiting Doze mode, triggering reconnect")
-                        restartTunnel()
-                    }
-                }
-                PowerManager.ACTION_POWER_SAVE_MODE_CHANGED -> {
-                    val saving = powerManager.isPowerSaveMode
-                    Log.i(TAG, "Power Save Mode: $saving")
-                    // In power save mode, increase reconnect debounce to reduce wake-ups
-                    isPowerSaveMode = saving
-                }
-            }
-        }
-    }
-
     private val reconnectWakeLock by lazy {
         powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UsqueProxy:reconnect")
             .apply { setReferenceCounted(false) }
     }
 
-    private var watchdogJob: Job? = null
-    private var reconnectDebounceJob: Job? = null
-
     override fun onCreate() {
         super.onCreate()
-        createNotificationChannel()
-        registerReceiver(
-            idleModeReceiver,
-            IntentFilter().apply {
-                addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
-                addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
-            },
-            Context.RECEIVER_NOT_EXPORTED
-        )
-        isDeviceIdle = powerManager.isDeviceIdleMode
-        isPowerSaveMode = powerManager.isPowerSaveMode
+        // VpnNotification init creates the channel; PowerStateWatcher seeds initial state.
+        notification
+        powerStateWatcher.register()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -189,7 +152,7 @@ class UsqueVpnService : VpnService() {
             // OS restarted service after process death — restore tunnel from prefs
             intent == null -> {
                 Log.i(TAG, "Process restore: re-establishing tunnel from saved preferences")
-                startForeground(NOTIFICATION_ID, buildNotification())
+                startForeground(VpnNotification.NOTIFICATION_ID, notification.buildConnecting())
                 launchStartJob()
                 return START_STICKY
             }
@@ -198,7 +161,7 @@ class UsqueVpnService : VpnService() {
                 return START_NOT_STICKY
             }
             intent.action == ACTION_RESTART -> {
-                startForeground(NOTIFICATION_ID, buildNotification())
+                startForeground(VpnNotification.NOTIFICATION_ID, notification.buildConnecting())
                 serviceScope.launch {
                     stopVpnInternal()
                     yield() // allow cancellation between stop and start
@@ -209,12 +172,12 @@ class UsqueVpnService : VpnService() {
             // Always-On VPN: system starts service with VpnService.SERVICE_INTERFACE action
             intent.action == SERVICE_INTERFACE -> {
                 Log.i(TAG, "Always-On VPN triggered by system")
-                startForeground(NOTIFICATION_ID, buildNotification())
+                startForeground(VpnNotification.NOTIFICATION_ID, notification.buildConnecting())
                 launchStartJob()
                 return START_STICKY
             }
             else -> {
-                startForeground(NOTIFICATION_ID, buildNotification())
+                startForeground(VpnNotification.NOTIFICATION_ID, notification.buildConnecting())
                 launchStartJob()
                 return START_STICKY
             }
@@ -223,8 +186,10 @@ class UsqueVpnService : VpnService() {
 
     private fun launchStartJob() {
         startJob?.cancel()
-        _events.tryEmit(VpnServiceEvent.Connecting)
-        updateNotification("Connecting...")
+        // Set before the tunnel job launches — the dead-man's switch and UI both read it.
+        TunnelStateHolder.isRunning = true
+        TunnelStateHolder.emit(VpnServiceEvent.Connecting)
+        notification.showConnecting()
         connectWakeLock.acquire(2 * 60 * 1000L) // 2-minute max to prevent leaks
         startJob = serviceScope.launch {
             try {
@@ -253,22 +218,13 @@ class UsqueVpnService : VpnService() {
     }
 
     private suspend fun startVpn(prefs: VpnPrefs) {
-        val config = JSONObject(prefs.activeConfigJson)
-        // SNI: use custom if set, otherwise default to ZT SNI for ZeroTrust profile
-        if (prefs.customSni.isNotBlank()) {
-            config.put("sni", prefs.customSni)
-        } else if (prefs.activeProfile == ProfileType.ZERO_TRUST) {
-            config.put("sni", "zt-masque.cloudflareclient.com")
-        }
-        if (prefs.connectUri.isNotBlank()) config.put("connect_uri", prefs.connectUri)
-        if (prefs.useHttp2) config.put("use_http2", true)
-
         val builder = Builder()
             .setMtu(1280)
             .setSession("UsqueProxy")
             .setMetered(prefs.isMetered)
 
         // Addresses from config
+        val config = JSONObject(prefs.activeConfigJson)
         config.optString("ipv4", "").takeIf { it.isNotEmpty() }?.let {
             builder.addAddress(it, 32)
         }
@@ -287,17 +243,14 @@ class UsqueVpnService : VpnService() {
         } ?: false
         if (privateDnsActive) {
             Log.i(TAG, "Android Private DNS is active — system DNS queries may bypass tunnel DNS interception")
-            config.put("private_dns_active", true)
         }
 
         // DNS
+        val systemDns = systemDnsServersFrom(underlyingLp)
         when (prefs.dnsMode) {
             DnsMode.SYSTEM -> {
-                val dns = systemDnsServersFrom(underlyingLp)
-                Log.d(TAG, "Using system DNS (protected forwarding): $dns")
-                // Pass system DNS servers to Go for protected socket forwarding
-                config.put("system_dns", JSONArray(dns))
-                dns.forEach { addr ->
+                Log.d(TAG, "Using system DNS (protected forwarding): $systemDns")
+                systemDns.forEach { addr ->
                     builder.addDnsServer(addr)
                     // Keep excludeRoute as optimization (reduces TUN traffic when it works)
                     runCatching {
@@ -316,19 +269,19 @@ class UsqueVpnService : VpnService() {
             DnsMode.CUSTOM_DOH -> {
                 builder.addDnsServer("1.1.1.1")
                 builder.addDnsServer("2606:4700:4700::1111")
-                config.put("doh_url", prefs.dohUrl)
             }
             DnsMode.CUSTOM_DOQ -> {
                 builder.addDnsServer("1.1.1.1")
                 builder.addDnsServer("2606:4700:4700::1111")
-                config.put("doq_url", prefs.doqUrl)
             }
         }
 
-        // Pass current network type for adaptive keepalive
-        config.put("network_type", detectNetworkType())
-
-        val configJson = config.toString()
+        val configJson = TunnelConfigBuilder.build(
+            prefs,
+            privateDnsActive = privateDnsActive,
+            systemDns = systemDns,
+            networkType = detectNetworkType(),
+        )
 
         // Routes: catch-all + exclusions
         builder.addRoute("0.0.0.0", 0)
@@ -388,8 +341,9 @@ class UsqueVpnService : VpnService() {
             else
                 "Failed to establish VPN interface"
             Log.e(TAG, reason)
-            lastError = reason
-            _events.tryEmit(VpnServiceEvent.Error(reason))
+            TunnelStateHolder.lastError = reason
+            TunnelStateHolder.emit(VpnServiceEvent.Error(reason))
+            notification.showError(reason)
             withContext(Dispatchers.Main) { stopSelf() }
             return
         }
@@ -400,10 +354,9 @@ class UsqueVpnService : VpnService() {
         waitForTunnelVerified(cm)
 
         val fd = vpnInterface!!.fd
-        isRunning = true
         Log.i(TAG, "VPN established: always-on=$isAlwaysOn, lockdown=$isLockdownEnabled")
-        _events.tryEmit(VpnServiceEvent.Started)
-        updateNotification("VPN is active")
+        TunnelStateHolder.emit(VpnServiceEvent.Started)
+        notification.showConnected()
         VpnTileService.requestUpdate(this)
 
         val protector = object : VpnProtector {
@@ -414,14 +367,15 @@ class UsqueVpnService : VpnService() {
 
         tunnelJob = serviceScope.launch {
             try {
-                Usquebind.startTunnel(configJson, fd.toLong(), protector)
+                Usquebind.startTunnel(configJson, fd.toLong(), protector, this@UsqueVpnService)
             } catch (e: Throwable) {
                 Log.e(TAG, "Tunnel error", e)
-                lastError = e.message ?: "Tunnel failed"
-                _events.tryEmit(VpnServiceEvent.Error(lastError!!))
+                val msg = e.message ?: "Tunnel failed"
+                TunnelStateHolder.lastError = msg
+                TunnelStateHolder.emit(VpnServiceEvent.Error(msg))
             } finally {
-                isRunning = false
-                _events.tryEmit(VpnServiceEvent.Stopped)
+                TunnelStateHolder.isRunning = false
+                TunnelStateHolder.emit(VpnServiceEvent.Stopped)
                 VpnTileService.requestUpdate(this@UsqueVpnService)
                 // Only self-stop if not in a managed stop — during those,
                 // stopVpnInternal() handles the lifecycle.
@@ -433,132 +387,150 @@ class UsqueVpnService : VpnService() {
             }
         }
 
-        registerNetworkCallback()
-        startWatchdog()
-    }
-
-    private fun startWatchdog() {
-        lastWatchdogRxTx = 0L
-        watchdogStallCount = 0
-        watchdogJob?.cancel()
-        watchdogJob = serviceScope.launch {
-            while (true) {
-                val interval = if (isPowerSaveMode) WATCHDOG_INTERVAL_MS * 2 else WATCHDOG_INTERVAL_MS
-                delay(interval)
-                if (!isRunning) break
-                runCatching {
-                    val statsJson = withContext(Dispatchers.IO) { Usquebind.getStats() }
-                    val stats = JSONObject(statsJson)
-                    val goConnected = stats.optBoolean("connected", false)
-                    val goRunning = stats.optBoolean("running", false)
-                    val rxTx = stats.optLong("rx_bytes", 0) + stats.optLong("tx_bytes", 0)
-                    val goHasNetwork = stats.optBoolean("has_network", true)
-                    val lastErr = stats.optString("last_error", "")
-
-                    if (goConnected) {
-                        errorGraceCount = 0
-                        lastSurfacedError = ""
-                        updateNotification("VPN is active")
-                    } else if (lastErr.isNotEmpty() && goRunning) {
-                        errorGraceCount++
-                        if (errorGraceCount >= ERROR_GRACE_TICKS && lastErr != lastSurfacedError) {
-                            lastError = lastErr
-                            lastSurfacedError = lastErr
-                            _events.tryEmit(VpnServiceEvent.Error(lastErr))
-                        }
-                        if (!goHasNetwork) {
-                            updateNotification("Waiting for network...")
-                        } else {
-                            updateNotification("Reconnecting...")
-                        }
-                    } else if (goRunning && !goHasNetwork) {
-                        errorGraceCount = 0
-                        updateNotification("Waiting for network...")
-                    } else if (goRunning) {
-                        errorGraceCount = 0
-                        updateNotification("Reconnecting...")
-                    }
-
-                    if (goConnected && rxTx > 0L && rxTx == lastWatchdogRxTx) {
-                        watchdogStallCount++
-                        if (watchdogStallCount >= 3) {
-                            Log.w(TAG, "Stuck connection detected (no traffic for ${watchdogStallCount * interval / 1000}s), triggering reconnect")
-                            withContext(Dispatchers.IO) { Usquebind.reconnect() }
-                            watchdogStallCount = 0
-                        }
-                    } else {
-                        watchdogStallCount = 0
-                    }
-                    lastWatchdogRxTx = rxTx
-                }
-            }
-        }
-    }
-
-    private fun stopWatchdog() {
-        watchdogJob?.cancel()
-        watchdogJob = null
+        networkWatcher.register()
+        startDeadMansSwitch()
     }
 
     /**
-     * Tracks the system default network via [ConnectivityManager.registerDefaultNetworkCallback].
-     * Fires reliably on WiFi ↔ cellular switches, even in background (foreground service).
+     * Dead-man's switch: if the tunnel reports neither running nor connected for a
+     * full interval, force a reconnect. Replaces the old 60s polling watchdog —
+     * the Go side now pushes state/stats/errors via [TunnelListener], so this only
+     * needs to catch silent death. Interval doubles in power-save mode because
+     * coroutine delays are frozen in Doze.
      */
-    private fun registerNetworkCallback() {
-        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        currentNetwork = cm.activeNetwork
-        val callback = object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                val previous = currentNetwork
-                currentNetwork = network
-                underlyingNetworkSet = false
-
-                if (isRunning) {
-                    setUnderlyingNetworks(arrayOf(network))
-                    underlyingNetworkSet = true
-                    // Tell Go side network is available — it triggers reconnect internally
-                    // if it was waiting. Only force Android-side reconnect if network changed.
-                    Usquebind.setConnectivity(true)
-                    if (network != previous) {
-                        Log.i(TAG, "Default network changed: $previous -> $network")
-                        restartTunnel()
-                    }
+    private fun startDeadMansSwitch() {
+        deadMansJob?.cancel()
+        deadMansJob = serviceScope.launch {
+            while (isActive) {
+                val interval = if (powerSave) DEAD_MANS_POWER_SAVE_MS else DEAD_MANS_INTERVAL_MS
+                delay(interval)
+                if (!TunnelStateHolder.isRunning) continue
+                val healthy = withContext(Dispatchers.IO) {
+                    val s = parseTunnelStats(Usquebind.getStats())
+                    s.running && s.connected
                 }
-            }
-
-            override fun onLosing(network: Network, maxMsToLive: Int) {
-                // Network handoff in progress — new network should arrive via onAvailable.
-                Log.d(TAG, "Network losing: $network (${maxMsToLive}ms to live)")
-            }
-
-            override fun onLost(network: Network) {
-                Log.i(TAG, "Default network lost: $network")
-                if (currentNetwork == network) {
-                    currentNetwork = null
-                    if (isRunning) {
-                        setUnderlyingNetworks(null)
-                        // Don't trigger reconnect — the Go side will detect the broken
-                        // connection and wait for SetConnectivity(true) instead of
-                        // hammering failed dials. This saves significant battery.
-                        Usquebind.setConnectivity(false)
-                    }
-                }
-            }
-
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                // Only update once per network — this callback fires very frequently
-                // (signal changes, bandwidth updates, etc.) and each setUnderlyingNetworks
-                // call wakes the system. We only need it once to confirm validation.
-                if (network == currentNetwork && isRunning && !underlyingNetworkSet &&
-                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)) {
-                    underlyingNetworkSet = true
-                    setUnderlyingNetworks(arrayOf(network))
-
+                if (!healthy) {
+                    Log.w(TAG, "dead-man's switch: tunnel silent, reconnecting")
+                    withContext(Dispatchers.IO) { Usquebind.reconnect() }
                 }
             }
         }
-        cm.registerDefaultNetworkCallback(callback)
-        networkCallback = callback
+    }
+
+    /**
+     * Performs full VPN shutdown. Serialized via [lifecycleMutex] to prevent
+     * concurrent start/stop races.
+     */
+    private suspend fun stopVpnInternal() {
+        // Cancel startJob BEFORE acquiring mutex to avoid deadlock:
+        // startJob holds mutex during setup, stop needs mutex for teardown.
+        startJob?.cancel()
+        startJob = null
+        lifecycleMutex.withLock {
+            isManagedShutdown = true
+            try {
+                TunnelStateHolder.emit(VpnServiceEvent.Disconnecting)
+                notification.showDisconnecting()
+                reconnectDebounceJob?.cancel()
+                deadMansJob?.cancel()
+                networkWatcher.unregister()
+                Usquebind.stopTunnel()
+                // Wait up to 3s for tunnel to shut down gracefully; cancel if it hangs
+                withTimeoutOrNull(3000L) { tunnelJob?.join() }
+                    ?: run {
+                        Log.w(TAG, "Tunnel job did not finish within 3s, cancelling")
+                        tunnelJob?.cancel()
+                    }
+                tunnelJob = null
+                vpnInterface?.close()
+                vpnInterface = null
+                TunnelStateHolder.isRunning = false
+                TunnelStateHolder.emit(VpnServiceEvent.Stopped)
+                VpnTileService.requestUpdate(this)
+                withContext(Dispatchers.Main) {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                    stopSelf()
+                }
+            } finally {
+                isManagedShutdown = false
+            }
+        } // lifecycleMutex.withLock
+    }
+
+    override fun onDestroy() {
+        reconnectDebounceJob?.cancel()
+        deadMansJob?.cancel()
+        powerStateWatcher.unregister()
+        // Synchronous cleanup: stop tunnel and cancel scope
+        Usquebind.stopTunnel()
+        tunnelJob?.cancel()
+        vpnInterface?.close()
+        TunnelStateHolder.isRunning = false
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
+    override fun onRevoke() {
+        Log.i(TAG, "VPN permission revoked")
+        // Synchronous cleanup — onRevoke may be followed immediately by onDestroy
+        reconnectDebounceJob?.cancel()
+        deadMansJob?.cancel()
+        networkWatcher.unregister()
+        Usquebind.stopTunnel()
+        tunnelJob?.cancel()
+        vpnInterface?.close()
+        vpnInterface = null
+        TunnelStateHolder.isRunning = false
+        TunnelStateHolder.emit(VpnServiceEvent.Stopped)
+        VpnTileService.requestUpdate(this)
+        super.onRevoke()
+    }
+
+    // --- TunnelListener (called from the Go tunnel goroutine) ---
+
+    override fun onStateChanged(state: String) {
+        when (val event = ListenerEventMapper.mapState(state)) {
+            VpnServiceEvent.Connecting -> TunnelStateHolder.emit(event)
+            VpnServiceEvent.Started -> {
+                TunnelStateHolder.emit(event)
+                notification.showConnected()
+            }
+            VpnServiceEvent.Disconnecting -> TunnelStateHolder.emit(event)
+            VpnServiceEvent.Stopped -> {
+                TunnelStateHolder.emit(event)
+                notification.cancel()
+            }
+            null -> Unit
+            else -> Unit
+        }
+    }
+
+    override fun onStats(stats: String) {
+        TunnelStateHolder.emit(VpnServiceEvent.Stats(parseTunnelStats(stats)))
+    }
+
+    override fun onError(err: String) {
+        TunnelStateHolder.lastError = err
+        ListenerEventMapper.mapError(err)?.let { event ->
+            TunnelStateHolder.emit(event)
+            notification.showError(err)
+        }
+    }
+
+    private fun restartTunnel() {
+        // Debounce rapid network changes (WiFi↔cellular) into a single reconnect.
+        reconnectDebounceJob?.cancel()
+        reconnectDebounceJob = serviceScope.launch {
+            delay(500L)
+            if (TunnelStateHolder.isRunning && !isDeviceIdle) {
+                reconnectWakeLock.acquire(10_000L) // 10s max for reconnect handshake
+                try {
+                    withContext(Dispatchers.IO) { Usquebind.reconnect() }
+                } finally {
+                    if (reconnectWakeLock.isHeld) reconnectWakeLock.release()
+                }
+            }
+        }
     }
 
     /**
@@ -585,99 +557,6 @@ class UsqueVpnService : VpnService() {
         } finally {
             runCatching { cm.unregisterNetworkCallback(cb) }
         }
-    }
-
-    private fun unregisterNetworkCallback() {
-        networkCallback?.let {
-            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-            runCatching { cm.unregisterNetworkCallback(it) }
-            networkCallback = null
-            currentNetwork = null
-        }
-    }
-
-    private fun restartTunnel() {
-        // Debounce rapid network changes (WiFi↔cellular) into a single reconnect.
-        reconnectDebounceJob?.cancel()
-        reconnectDebounceJob = serviceScope.launch {
-            delay(500L)
-            if (isRunning && !isDeviceIdle) {
-                reconnectWakeLock.acquire(10_000L) // 10s max for reconnect handshake
-                try {
-                    withContext(Dispatchers.IO) { Usquebind.reconnect() }
-                } finally {
-                    if (reconnectWakeLock.isHeld) reconnectWakeLock.release()
-                }
-            }
-        }
-    }
-
-    /**
-     * Performs full VPN shutdown. Serialized via [lifecycleMutex] to prevent
-     * concurrent start/stop races.
-     */
-    private suspend fun stopVpnInternal() {
-        // Cancel startJob BEFORE acquiring mutex to avoid deadlock:
-        // startJob holds mutex during setup, stop needs mutex for teardown.
-        startJob?.cancel()
-        startJob = null
-        lifecycleMutex.withLock {
-        isManagedShutdown = true
-        try {
-        _events.tryEmit(VpnServiceEvent.Disconnecting)
-        updateNotification("Disconnecting...")
-        reconnectDebounceJob?.cancel()
-        stopWatchdog()
-        unregisterNetworkCallback()
-        Usquebind.stopTunnel()
-        // Wait up to 3s for tunnel to shut down gracefully; cancel if it hangs
-        withTimeoutOrNull(3000L) { tunnelJob?.join() }
-            ?: run {
-                Log.w(TAG, "Tunnel job did not finish within 3s, cancelling")
-                tunnelJob?.cancel()
-            }
-        tunnelJob = null
-        vpnInterface?.close()
-        vpnInterface = null
-        isRunning = false
-        _events.tryEmit(VpnServiceEvent.Stopped)
-        VpnTileService.requestUpdate(this)
-        withContext(Dispatchers.Main) {
-            stopForeground(STOP_FOREGROUND_REMOVE)
-            stopSelf()
-        }
-        } finally {
-            isManagedShutdown = false
-        }
-        } // lifecycleMutex.withLock
-    }
-
-    override fun onDestroy() {
-        reconnectDebounceJob?.cancel()
-        stopWatchdog()
-        runCatching { unregisterReceiver(idleModeReceiver) }
-        // Synchronous cleanup: stop tunnel and cancel scope
-        Usquebind.stopTunnel()
-        tunnelJob?.cancel()
-        vpnInterface?.close()
-        serviceScope.cancel()
-        super.onDestroy()
-    }
-
-    override fun onRevoke() {
-        Log.i(TAG, "VPN permission revoked")
-        // Synchronous cleanup — onRevoke may be followed immediately by onDestroy
-        reconnectDebounceJob?.cancel()
-        stopWatchdog()
-        unregisterNetworkCallback()
-        Usquebind.stopTunnel()
-        tunnelJob?.cancel()
-        vpnInterface?.close()
-        vpnInterface = null
-        isRunning = false
-        _events.tryEmit(VpnServiceEvent.Stopped)
-        VpnTileService.requestUpdate(this)
-        super.onRevoke()
     }
 
     /**
@@ -805,42 +684,5 @@ class UsqueVpnService : VpnService() {
             caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "cellular"
             else -> ""
         }
-    }
-
-    private fun createNotificationChannel() {
-        val channel = NotificationChannel(
-            CHANNEL_ID, "VPN Service", NotificationManager.IMPORTANCE_LOW
-        ).apply { description = "UsqueProxy VPN status" }
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(channel)
-    }
-
-    private fun updateNotification(status: String) {
-        runCatching {
-            val nm = getSystemService(NotificationManager::class.java)
-            nm.notify(NOTIFICATION_ID, buildNotification(status))
-        }
-    }
-
-    private fun buildNotification(status: String = "VPN is active"): Notification {
-        val stopIntent = Intent(this, UsqueVpnService::class.java).apply {
-            action = ACTION_STOP
-        }
-        val stopPending = PendingIntent.getService(
-            this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE
-        )
-        val openIntent = Intent(this, MainActivity::class.java)
-        val openPending = PendingIntent.getActivity(
-            this, 0, openIntent, PendingIntent.FLAG_IMMUTABLE
-        )
-
-        return Notification.Builder(this, CHANNEL_ID)
-            .setContentTitle("UsqueProxy")
-            .setContentText(status)
-            .setSmallIcon(R.drawable.ic_vpn_tile)
-            .setContentIntent(openPending)
-            .addAction(Notification.Action.Builder(null, "Disconnect", stopPending).build())
-            .setOngoing(true)
-            .build()
     }
 }
