@@ -4,6 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
+import android.os.Build
 import android.os.PowerManager
 
 /**
@@ -27,14 +28,16 @@ class PowerStateWatcher(
     }
 
     fun register() {
-        context.registerReceiver(
-            receiver,
-            IntentFilter().apply {
-                addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
-                addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
-            },
-            Context.RECEIVER_NOT_EXPORTED,
-        )
+        val filter = IntentFilter().apply {
+            addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
+            addAction(PowerManager.ACTION_DEVICE_IDLE_MODE_CHANGED)
+        }
+        // RECEIVER_NOT_EXPORTED is API 33+; on older versions the flags overload ignores it
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(receiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(receiver, filter)
+        }
         onPowerSaveChanged(pm.isPowerSaveMode)
         onDeviceIdleChanged(pm.isDeviceIdleMode)
     }

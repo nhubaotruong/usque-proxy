@@ -18,7 +18,7 @@
 
 **Environment:**
 
-- Android: compileSdk 37, minSdk 35 (Android 15+), targetSdk 36 (Android 16)
+- Android: compileSdk 37, minSdk 30 (Android 11+), targetSdk 36 (Android 16)
 - ABI: arm64-v8a (release, see `app/build.gradle.kts` `ndk.abiFilters`); x86_64 added for debug builds (emulator testing)
 - JVM: Java 21 source/target compatibility
 
@@ -56,7 +56,7 @@
 
 **Critical:**
 
-- `github.com/Diniboy1123/usque v1.5.1-0.20260720063354-6aa03fc97d12` - Core MASQUE/WARP protocol implementation (Go)
+- `github.com/Diniboy1123/usque v1.5.1-0.20260720063354-6aa03fc97d12` - Core MASQUE/WARP protocol implementation (Go). Note: this pseudo-version IS the upstream `v4.2.1` tag (commit 6aa03fc97d12); Go tooling rejects the literal `v4.2.1` version because the module path lacks the required `/v4` suffix
 - `github.com/Diniboy1123/connect-ip-go v0.0.0-20260613064811-66cba32d7d33` - CONNECT-IP (RFC 9484) implementation (Go)
 - `github.com/quic-go/quic-go v0.60.0` - QUIC transport (Go), used for MASQUE tunnel and DoQ DNS
 - `gvisor.dev/gvisor v0.0.0-20260826181857-eb77d6c8310a` - Userspace networking stack for the TUN device
@@ -97,13 +97,13 @@
 
 - JDK 25 (used in CI via `actions/setup-java`, temurin)
 - Go 1.26.3 (toolchain pinned via `GOTOOLCHAIN=go1.26.3` in `build-usque.sh`)
-- Android SDK: platforms `android-37`, `android-36`, `android-31`, build-tools `36.0.0`, NDK `29.0.14206865`
+- Android SDK: platforms `android-37`, `android-36`, `android-30`, build-tools `36.0.0`, NDK `29.0.14206865`
 - gomobile + gobind installed from `golang.org/x/mobile` at `v0.0.0-20260821190718-4776eadac327` (CI pin matches go.mod)
 - `build-usque.sh` must be run before `./gradlew assembleRelease` to produce the AAR
 
 **Production:**
 
-- Android 15+ (API 35) devices, arm64-v8a only
+- Android 11+ (API 30) devices, arm64-v8a only
 - Release APK signed with provided keystore, distributed via GitHub Releases
 
 ---

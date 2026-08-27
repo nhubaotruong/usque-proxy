@@ -37,7 +37,7 @@ jobs:
           distribution: "temurin"
 
       - name: Install SDK packages
-        run: sdkmanager "platforms;android-37.0" "platforms;android-36" "platforms;android-31" "build-tools;36.0.0" "ndk;29.0.14206865"
+        run: sdkmanager "platforms;android-37.0" "platforms;android-36" "platforms;android-30" "build-tools;36.0.0" "ndk;29.0.14206865"
 
       - name: Install gomobile
         run: |
