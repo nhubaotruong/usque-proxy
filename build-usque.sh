@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/usque-bind"
 
 echo "Building usque AAR via gomobile..."
-# Force Go 1.26.3 toolchain to match go.mod and avoid gvisor build tag conflicts
-export GOTOOLCHAIN=go1.26.3
+# Force Go 1.27.0 toolchain to match go.mod and avoid gvisor build tag conflicts
+export GOTOOLCHAIN=go1.27.0
 # Ensure GOPATH/bin is in PATH for gomobile/gobind
 export PATH="$(go env GOPATH)/bin:$PATH"
 # Use Go module proxy to avoid fetching from deleted repos (e.g. mitchellh/osext)
