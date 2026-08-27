@@ -355,7 +355,7 @@ func TestGetStatsShape(t *testing.T) {
 }
 ```
 
-1. `TestStartTunnelInvalidConfig` — new signature (protector arg gone):
+2. `TestStartTunnelInvalidConfig` — new signature (protector arg gone):
 
 ```go
 func TestStartTunnelInvalidConfig(t *testing.T) {
@@ -376,9 +376,9 @@ Expected: FAIL — wrong arity (compiler) for `StartTunnel`, stats keys mismatch
 
 - [ ] **Step 3: Rewrite `bind.go`**
 
-3a. **Delete these functions and types** (entire bodies): `FdAdapter` struct + its `ReadPacket`/`WritePacket` methods (replaced by `filterDevice`), `maintainTunnel`, `connectHappyEyeballs`, `connectTunnelProtected`, `connectTunnelProtectedH2`, `forwardUp`, `forwardDown`, `waitForNetwork`, `sleepCtx`, `cleanup`, `protectUDPConn` (already gone in Task 1), `SetConnectivity`, `Reconnect`, `taggedEndpoint`, `connResult`. **Keep** `selfSignedCert`, `isDNSQuery`, `sni()`/`connectUri()` methods, `setListener`/`getListener`/`safeNotify`/`notifyState`/`notifyStats`/`notifyError`, all register/enroll functions.
+3a. **Delete these functions and types** (entire bodies): `FdAdapter` struct + its `ReadPacket`/`WritePacket` methods (replaced by `filterDevice`), `maintainTunnel`, `connectHappyEyeballs`, `connectTunnelProtected`, `connectTunnelProtectedH2`, `forwardUp`, `forwardDown`, `waitForNetwork`, `sleepCtx`, `cleanup`, `protectUDPConn` (already gone in Task 1), `SetConnectivity`, `Reconnect`, `taggedEndpoint`, `connResult`, and the `VpnProtector` interface definition (`type VpnProtector interface { ProtectFd(fd int) bool }` at bind.go ~line 93 — gomobile exports every public type, so it must go or `VpnProtector.class` stays in the AAR and Task 4's verification fails). **Keep** `selfSignedCert`, `isDNSQuery`, `sni()`/`connectUri()` methods, `setListener`/`getListener`/`safeNotify`/`notifyState`/`notifyStats`/`notifyError`, all register/enroll functions.
 
-3b. **Trim global state** — delete `hasNetwork`, `connectedAt`, `connectCount`, `lastError`, `networkCh`, `reconnectCh` (keep `mu`, `cancel`, `done`, `running`, `connected`, `startTime`, `txBytes`, `rxBytes`, `quicSessionCache`).
+3b. **Trim global state** — delete `hasNetwork`, `connectedAt`, `connectCount`, `lastError`, `networkCh`, `reconnectCh` (keep `mu`, `cancel`, `done`, `running`, `connected`, `startTime`, `txBytes`, `rxBytes`, `quicSessionCache`). `lastError` is safe to delete: all its writers (maintainTunnel lines 614–686, StartTunnel init line 236) and its only reader (GetStats line 333) are removed by this rewrite — `notifyError` does NOT touch it (it only calls `l.OnError(err)`).
 
 3c. **Rewrite `StartTunnel`** (replaces the old 4-arg version):
 
@@ -410,6 +410,10 @@ func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
  }
  config.AppConfig = tcfg.Config
  config.ConfigLoaded = true
+	if tcfg.EndpointV4 == "" {
+		mu.Unlock()
+		return fmt.Errorf("no endpoint v4 in config")
+	}
 
  ctx, c := context.WithCancel(context.Background())
  cancel = c
@@ -529,8 +533,8 @@ func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
   }
  }()
 
- notifyState("connecting")
- api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
+	notifyState("connecting")
+	api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
   TLSConfig:         tlsCfg,
   KeepalivePeriod:   30 * time.Second,
   InitialPacketSize: 1242,
@@ -631,6 +635,8 @@ cd /var/home/nhubao/StudioProjects/usque-proxy && unzip -l app/libs/usquebind.aa
 ```
 
 Expected: `classes.jar` present with `usquebind/Usquebind.class`, `usquebind/TunnelListener.class`; no `usquebind/VpnProtector.class`.
+
+**⚠ Do NOT run any Kotlin build (`compileDebugKotlin`/`assembleDebug`/unit tests) between Task 4 and Task 5.** The Kotlin sources still reference `Usquebind.setConnectivity`/`reconnect`/`VpnProtector`, which no longer exist in the regenerated AAR — this is expected; Task 5 removes those references. First Kotlin compile happens at Task 5 Step 4.
 
 - [ ] **Step 3: Commit**
 
