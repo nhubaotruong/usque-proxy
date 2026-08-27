@@ -21,7 +21,6 @@ import com.nhubaotruong.usqueproxy.data.SplitMode
 import com.nhubaotruong.usqueproxy.data.VpnPreferences
 import com.nhubaotruong.usqueproxy.data.VpnPrefs
 import com.nhubaotruong.usqueproxy.tile.VpnTileService
-import org.json.JSONObject
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -35,10 +34,13 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.yield
+import org.json.JSONObject
 import usquebind.TunnelListener
 import usquebind.Usquebind
 
-class UsqueVpnService : VpnService(), TunnelListener {
+class UsqueVpnService :
+    VpnService(),
+    TunnelListener {
     companion object {
         const val TAG = "UsqueVpnService"
         const val ACTION_STOP = "com.nhubaotruong.usqueproxy.STOP_VPN"
@@ -48,25 +50,25 @@ class UsqueVpnService : VpnService(), TunnelListener {
         private val LOCAL_NETWORK_EXCLUSIONS_V4: List<Pair<java.net.InetAddress, Int>> by lazy {
             listOf(
                 "10.0.0.0" to 8,
-                "169.254.0.0" to 16,       // Link-local
+                "169.254.0.0" to 16, // Link-local
                 "172.16.0.0" to 12,
                 "192.0.0.0" to 24,
                 "192.168.0.0" to 16,
-                "224.0.0.0" to 24,          // Local multicast
-                "240.0.0.0" to 4,           // Reserved
-                "255.255.255.255" to 32,    // Broadcast
+                "224.0.0.0" to 24, // Local multicast
+                "240.0.0.0" to 4, // Reserved
+                "255.255.255.255" to 32, // Broadcast
             ).map { (addr, prefix) -> java.net.InetAddress.getByName(addr) to prefix }
         }
 
         private val LOCAL_NETWORK_EXCLUSIONS_V6: List<Pair<java.net.InetAddress, Int>> by lazy {
             listOf(
-                "fd00::" to 8,              // ULA
-                "fe80::" to 10,             // Link-local
-                "ff01::" to 16,             // Interface-local multicast
-                "ff02::" to 16,             // Link-local multicast
-                "ff03::" to 16,             // Realm-local multicast
-                "ff04::" to 16,             // Admin-local multicast
-                "ff05::" to 16,             // Site-local multicast
+                "fd00::" to 8, // ULA
+                "fe80::" to 10, // Link-local
+                "ff01::" to 16, // Interface-local multicast
+                "ff02::" to 16, // Link-local multicast
+                "ff03::" to 16, // Realm-local multicast
+                "ff04::" to 16, // Admin-local multicast
+                "ff05::" to 16, // Site-local multicast
             ).map { (addr, prefix) -> java.net.InetAddress.getByName(addr) to prefix }
         }
     }
@@ -93,7 +95,8 @@ class UsqueVpnService : VpnService(), TunnelListener {
 
     private val powerManager by lazy { getSystemService(Context.POWER_SERVICE) as PowerManager }
     private val connectWakeLock by lazy {
-        powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UsqueProxy:connect")
+        powerManager
+            .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "UsqueProxy:connect")
             .apply { setReferenceCounted(false) }
     }
 
@@ -103,7 +106,11 @@ class UsqueVpnService : VpnService(), TunnelListener {
         notification
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int,
+    ): Int {
         when {
             // OS restarted service after process death — restore tunnel from prefs
             intent == null -> {
@@ -112,10 +119,12 @@ class UsqueVpnService : VpnService(), TunnelListener {
                 launchStartJob()
                 return START_STICKY
             }
+
             intent.action == ACTION_STOP -> {
                 serviceScope.launch { stopVpnInternal() }
                 return START_NOT_STICKY
             }
+
             intent.action == ACTION_RESTART -> {
                 startForeground(VpnNotification.NOTIFICATION_ID, notification.buildConnecting())
                 serviceScope.launch {
@@ -128,6 +137,7 @@ class UsqueVpnService : VpnService(), TunnelListener {
                 }
                 return START_STICKY
             }
+
             // Always-On VPN: system starts service with VpnService.SERVICE_INTERFACE action
             intent.action == SERVICE_INTERFACE -> {
                 Log.i(TAG, "Always-On VPN triggered by system")
@@ -135,6 +145,7 @@ class UsqueVpnService : VpnService(), TunnelListener {
                 launchStartJob()
                 return START_STICKY
             }
+
             else -> {
                 startForeground(VpnNotification.NOTIFICATION_ID, notification.buildConnecting())
                 launchStartJob()
@@ -150,37 +161,39 @@ class UsqueVpnService : VpnService(), TunnelListener {
         TunnelStateHolder.emit(VpnServiceEvent.Connecting)
         notification.showConnecting()
         connectWakeLock.acquire(2 * 60 * 1000L) // 2-minute max to prevent leaks
-        startJob = serviceScope.launch {
-            try {
-                // Serialize with stopVpnInternal to prevent start/stop races
-                lifecycleMutex.withLock {
-                    ensureActive() // throw CancellationException if cancelled while waiting for lock
-                    val prefs = VpnPreferences(this@UsqueVpnService).prefsFlow.first()
+        startJob =
+            serviceScope.launch {
+                try {
+                    // Serialize with stopVpnInternal to prevent start/stop races
+                    lifecycleMutex.withLock {
+                        ensureActive() // throw CancellationException if cancelled while waiting for lock
+                        val prefs = VpnPreferences(this@UsqueVpnService).prefsFlow.first()
 
-                    if (!prefs.isActiveRegistered || prefs.activeConfigJson.isEmpty()) {
-                        Log.e(TAG, "No config found for active profile, stopping")
-                        withContext(Dispatchers.Main) { stopSelf() }
-                        return@withLock
+                        if (!prefs.isActiveRegistered || prefs.activeConfigJson.isEmpty()) {
+                            Log.e(TAG, "No config found for active profile, stopping")
+                            withContext(Dispatchers.Main) { stopSelf() }
+                            return@withLock
+                        }
+
+                        // Refresh Office 365 endpoint cache before starting VPN
+                        if (prefs.bypassOffice365) {
+                            runCatching { Office365Endpoints.refreshCache(this@UsqueVpnService) }
+                        }
+
+                        startVpn(prefs)
                     }
-
-                    // Refresh Office 365 endpoint cache before starting VPN
-                    if (prefs.bypassOffice365) {
-                        runCatching { Office365Endpoints.refreshCache(this@UsqueVpnService) }
-                    }
-
-                    startVpn(prefs)
+                } finally {
+                    if (connectWakeLock.isHeld) connectWakeLock.release()
                 }
-            } finally {
-                if (connectWakeLock.isHeld) connectWakeLock.release()
             }
-        }
     }
 
     private suspend fun startVpn(prefs: VpnPrefs) {
-        val builder = Builder()
-            .setMtu(1280)
-            .setSession("UsqueProxy")
-            .setMetered(prefs.isMetered)
+        val builder =
+            Builder()
+                .setMtu(1280)
+                .setSession("UsqueProxy")
+                .setMetered(prefs.isMetered)
 
         // Addresses from config
         val config = JSONObject(prefs.activeConfigJson)
@@ -197,9 +210,10 @@ class UsqueVpnService : VpnService(), TunnelListener {
         // left tunnel DNS broken until the user toggled Private DNS off and on again.
         val cmEarly = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val underlyingLp = underlyingLinkProperties(cmEarly)
-        val privateDnsActive = underlyingLp?.let {
-            it.isPrivateDnsActive && it.privateDnsServerName != null
-        } ?: false
+        val privateDnsActive =
+            underlyingLp?.let {
+                it.isPrivateDnsActive && it.privateDnsServerName != null
+            } ?: false
         if (privateDnsActive) {
             Log.i(TAG, "Android Private DNS is active — system DNS queries may bypass tunnel DNS interception")
         }
@@ -228,26 +242,30 @@ class UsqueVpnService : VpnService(), TunnelListener {
                     }
                 }
             }
+
             DnsMode.CLOUDFLARE -> {
                 builder.addDnsServer("1.1.1.1")
                 builder.addDnsServer("2606:4700:4700::1111")
             }
+
             DnsMode.CUSTOM_DOH -> {
                 builder.addDnsServer("1.1.1.1")
                 builder.addDnsServer("2606:4700:4700::1111")
             }
+
             DnsMode.CUSTOM_DOQ -> {
                 builder.addDnsServer("1.1.1.1")
                 builder.addDnsServer("2606:4700:4700::1111")
             }
         }
 
-        var configJson = TunnelConfigBuilder.build(
-            prefs,
-            privateDnsActive = privateDnsActive,
-            systemDns = systemDns,
-            networkType = detectNetworkType(),
-        )
+        var configJson =
+            TunnelConfigBuilder.build(
+                prefs,
+                privateDnsActive = privateDnsActive,
+                systemDns = systemDns,
+                networkType = detectNetworkType(),
+            )
 
         // Routes: catch-all + exclusions
         builder.addRoute("0.0.0.0", 0)
@@ -280,12 +298,14 @@ class UsqueVpnService : VpnService(), TunnelListener {
                     runCatching { builder.addAllowedApplication(pkg) }
                 }
             }
+
             SplitMode.EXCLUDE -> {
                 for (pkg in prefs.excludedApps) {
                     runCatching { builder.addDisallowedApplication(pkg) }
                 }
                 runCatching { builder.addDisallowedApplication(packageName) }
             }
+
             SplitMode.ALL -> {
                 runCatching { builder.addDisallowedApplication(packageName) }
             }
@@ -318,10 +338,12 @@ class UsqueVpnService : VpnService(), TunnelListener {
         vpnInterface = builder.establish() ?: run {
             // establish() returns null when: VPN permission not granted, another VPN
             // is active, or the app was put in a restricted background state.
-            val reason = if (prepare(this@UsqueVpnService) != null)
-                "VPN permission not granted or another VPN is active"
-            else
-                "Failed to establish VPN interface"
+            val reason =
+                if (prepare(this@UsqueVpnService) != null) {
+                    "VPN permission not granted or another VPN is active"
+                } else {
+                    "Failed to establish VPN interface"
+                }
             Log.e(TAG, reason)
             TunnelStateHolder.lastError = reason
             TunnelStateHolder.emit(VpnServiceEvent.Error(reason))
@@ -341,31 +363,31 @@ class UsqueVpnService : VpnService(), TunnelListener {
         notification.showConnected()
         VpnTileService.requestUpdate(this)
 
-        tunnelJob = serviceScope.launch {
-            try {
-                Usquebind.startTunnel(configJson, fd.toLong(), this@UsqueVpnService)
-            } catch (e: Throwable) {
-                Log.e(TAG, "Tunnel error", e)
-                val msg = e.message ?: "Tunnel failed"
-                TunnelStateHolder.lastError = msg
-                TunnelStateHolder.emit(VpnServiceEvent.Error(msg))
-            } finally {
-                TunnelStateHolder.isRunning = false
-                TunnelStateHolder.emit(VpnServiceEvent.Stopped)
-                VpnTileService.requestUpdate(this@UsqueVpnService)
-                // Only self-stop if not in a managed stop — during those,
-                // stopVpnInternal() handles the lifecycle.
-                // Use Handler.post (non-suspending) to avoid CancellationException
-                // inside finally if the coroutine was cancelled.
-                if (!isManagedShutdown) {
-                    Handler(Looper.getMainLooper()).post { stopSelf() }
+        tunnelJob =
+            serviceScope.launch {
+                try {
+                    Usquebind.startTunnel(configJson, fd.toLong(), this@UsqueVpnService)
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Tunnel error", e)
+                    val msg = e.message ?: "Tunnel failed"
+                    TunnelStateHolder.lastError = msg
+                    TunnelStateHolder.emit(VpnServiceEvent.Error(msg))
+                } finally {
+                    TunnelStateHolder.isRunning = false
+                    TunnelStateHolder.emit(VpnServiceEvent.Stopped)
+                    VpnTileService.requestUpdate(this@UsqueVpnService)
+                    // Only self-stop if not in a managed stop — during those,
+                    // stopVpnInternal() handles the lifecycle.
+                    // Use Handler.post (non-suspending) to avoid CancellationException
+                    // inside finally if the coroutine was cancelled.
+                    if (!isManagedShutdown) {
+                        Handler(Looper.getMainLooper()).post { stopSelf() }
+                    }
                 }
             }
-        }
 
         networkWatcher.register()
     }
-
 
     /**
      * Performs full VPN shutdown. Serialized via [lifecycleMutex] to prevent
@@ -435,18 +457,31 @@ class UsqueVpnService : VpnService(), TunnelListener {
 
     override fun onStateChanged(state: String) {
         when (val event = ListenerEventMapper.mapState(state)) {
-            VpnServiceEvent.Connecting -> TunnelStateHolder.emit(event)
+            VpnServiceEvent.Connecting -> {
+                TunnelStateHolder.emit(event)
+            }
+
             VpnServiceEvent.Started -> {
                 TunnelStateHolder.emit(event)
                 notification.showConnected()
             }
-            VpnServiceEvent.Disconnecting -> TunnelStateHolder.emit(event)
+
+            VpnServiceEvent.Disconnecting -> {
+                TunnelStateHolder.emit(event)
+            }
+
             VpnServiceEvent.Stopped -> {
                 TunnelStateHolder.emit(event)
                 notification.cancel()
             }
-            null -> Unit
-            else -> Unit
+
+            null -> {
+                Unit
+            }
+
+            else -> {
+                Unit
+            }
         }
     }
 
@@ -462,7 +497,6 @@ class UsqueVpnService : VpnService(), TunnelListener {
         }
     }
 
-
     /**
      * Waits up to 500ms for the system to validate the VPN tunnel network.
      * Ensures NET_CAPABILITY_VALIDATED is set before apps start using the tunnel,
@@ -470,15 +504,19 @@ class UsqueVpnService : VpnService(), TunnelListener {
      */
     private fun waitForTunnelVerified(cm: ConnectivityManager) {
         val latch = java.util.concurrent.CountDownLatch(1)
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
-                    caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val cb =
+            object : ConnectivityManager.NetworkCallback() {
+                override fun onCapabilitiesChanged(
+                    network: Network,
+                    caps: NetworkCapabilities,
                 ) {
-                    latch.countDown()
+                    if (!caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN) &&
+                        caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                    ) {
+                        latch.countDown()
+                    }
                 }
             }
-        }
         cm.registerDefaultNetworkCallback(cb)
         try {
             if (!latch.await(500, java.util.concurrent.TimeUnit.MILLISECONDS)) {
@@ -496,7 +534,10 @@ class UsqueVpnService : VpnService(), TunnelListener {
      * exact prefix length of the user's local network (e.g., /24) instead of
      * overly broad ranges (e.g., 192.168.0.0/16).
      */
-    private fun excludeLocalNetworks(builder: Builder, excludePrefixes: MutableList<String>) {
+    private fun excludeLocalNetworks(
+        builder: Builder,
+        excludePrefixes: MutableList<String>,
+    ) {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val dynamicExclusions = mutableListOf<Pair<java.net.InetAddress, Int>>()
 
@@ -505,14 +546,17 @@ class UsqueVpnService : VpnService(), TunnelListener {
         runCatching {
             val discoveredNetworks = java.util.concurrent.ConcurrentLinkedQueue<Network>()
             val latch = java.util.concurrent.CountDownLatch(1)
-            val request = NetworkRequest.Builder()
-                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-                .build()
-            val cb = object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: Network) {
-                    discoveredNetworks.add(network)
+            val request =
+                NetworkRequest
+                    .Builder()
+                    .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                    .build()
+            val cb =
+                object : ConnectivityManager.NetworkCallback() {
+                    override fun onAvailable(network: Network) {
+                        discoveredNetworks.add(network)
+                    }
                 }
-            }
             cm.registerNetworkCallback(request, cb)
             // Brief wait for callbacks to fire for already-connected networks
             latch.await(100, java.util.concurrent.TimeUnit.MILLISECONDS)
@@ -566,6 +610,7 @@ class UsqueVpnService : VpnService(), TunnelListener {
         }
         return false
     }
+
     /**
      * excludeRoute exists only as excludeRoute(IpPrefix), which is API 33+ — the
      * String/InetAddress overloads were removed from the platform before API 30
@@ -573,7 +618,10 @@ class UsqueVpnService : VpnService(), TunnelListener {
      * framework). So route exclusions are simply unavailable on API 30-32; skip
      * them there. Fails soft (route not excluded) if a range is rejected.
      */
-    private fun Builder.excludeRouteCompat(addr: java.net.InetAddress, prefixLength: Int) {
+    private fun Builder.excludeRouteCompat(
+        addr: java.net.InetAddress,
+        prefixLength: Int,
+    ) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             excludeRoute(IpPrefix(addr, prefixLength))
         } else {
@@ -597,17 +645,25 @@ class UsqueVpnService : VpnService(), TunnelListener {
      * the VPN itself and reports the VPN's own LinkProperties.
      */
     private fun underlyingLinkProperties(cm: ConnectivityManager): LinkProperties? {
-        val result = java.util.concurrent.atomic.AtomicReference<LinkProperties?>(null)
+        val result =
+            java.util.concurrent.atomic
+                .AtomicReference<LinkProperties?>(null)
         val latch = java.util.concurrent.CountDownLatch(1)
-        val request = NetworkRequest.Builder()
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
-            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-            .build()
-        val cb = object : ConnectivityManager.NetworkCallback() {
-            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
-                if (result.compareAndSet(null, lp)) latch.countDown()
+        val request =
+            NetworkRequest
+                .Builder()
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_NOT_VPN)
+                .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                .build()
+        val cb =
+            object : ConnectivityManager.NetworkCallback() {
+                override fun onLinkPropertiesChanged(
+                    network: Network,
+                    lp: LinkProperties,
+                ) {
+                    if (result.compareAndSet(null, lp)) latch.countDown()
+                }
             }
-        }
         runCatching {
             cm.registerNetworkCallback(request, cb)
             latch.await(1, java.util.concurrent.TimeUnit.SECONDS)
