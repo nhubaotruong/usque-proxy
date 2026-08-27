@@ -9,6 +9,7 @@ import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import androidx.core.content.ContextCompat
 import com.nhubaotruong.usqueproxy.MainActivity
+import com.nhubaotruong.usqueproxy.vpn.TunnelStateHolder
 import com.nhubaotruong.usqueproxy.vpn.UsqueVpnService
 
 class VpnTileService : TileService() {
@@ -29,7 +30,7 @@ class VpnTileService : TileService() {
 
     override fun onClick() {
         super.onClick()
-        if (UsqueVpnService.isRunning) {
+        if (TunnelStateHolder.isRunning) {
             updateTile(Tile.STATE_INACTIVE, "Disconnecting...")
             val intent = Intent(this, UsqueVpnService::class.java).apply {
                 action = UsqueVpnService.ACTION_STOP
@@ -49,8 +50,8 @@ class VpnTileService : TileService() {
     }
 
     private fun updateTile(
-        state: Int = if (UsqueVpnService.isRunning) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE,
-        subtitle: String = if (UsqueVpnService.isRunning) "Connected" else "Disconnected",
+        state: Int = if (TunnelStateHolder.isRunning) Tile.STATE_ACTIVE else Tile.STATE_INACTIVE,
+        subtitle: String = if (TunnelStateHolder.isRunning) "Connected" else "Disconnected",
     ) {
         val tile = qsTile ?: return
         tile.state = state

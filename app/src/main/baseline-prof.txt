@@ -1,0 +1,5 @@
+HSPLandroidx.compose.ui.platform.ComposeView;-><init>(...)
+HSPLcom/nhubaotruong/usqueproxy/MainActivity;->onCreate(...)
+HSPLcom/nhubaotruong/usqueproxy/ui/nav/AppNavigationKt;->AppNavigation(...)
+HSPLcom/nhubaotruong/usqueproxy/ui/screen/MainScreenKt;->MainScreen(...)
+HSPLcom/nhubaotruong/usqueproxy/ui/viewmodel/VpnViewModel;-><init>(...)

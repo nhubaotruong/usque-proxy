@@ -4,8 +4,8 @@ set -euo pipefail
 cd "$(dirname "$0")/usque-bind"
 
 echo "Building usque AAR via gomobile..."
-# Force Go 1.24.2 toolchain to match go.mod and avoid gvisor build tag conflicts
-export GOTOOLCHAIN=go1.25.5
+# Force Go 1.26.3 toolchain to match go.mod and avoid gvisor build tag conflicts
+export GOTOOLCHAIN=go1.26.3
 # Ensure GOPATH/bin is in PATH for gomobile/gobind
 export PATH="$(go env GOPATH)/bin:$PATH"
 # Use Go module proxy to avoid fetching from deleted repos (e.g. mitchellh/osext)
@@ -23,7 +23,7 @@ if [ -f default.pgo ]; then
   PGO_FLAG="-pgo=default.pgo"
 fi
 
-gomobile bind -v -target=android/arm64 -androidapi 35 \
+gomobile bind -v -target=android/arm64,android/amd64 -androidapi 35 \
   -trimpath \
   -ldflags="-s -w" \
   ${PGO_FLAG:+"$PGO_FLAG"} \
