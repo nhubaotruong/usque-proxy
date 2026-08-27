@@ -16,7 +16,6 @@ import (
 	"log"
 	"math/big"
 	"net"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -24,14 +23,9 @@ import (
 	"syscall"
 	"time"
 
-	connectip "github.com/Diniboy1123/connect-ip-go"
 	"github.com/Diniboy1123/usque/api"
 	"github.com/Diniboy1123/usque/config"
 	"github.com/Diniboy1123/usque/models"
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
-	"github.com/yosida95/uritemplate/v3"
-	"golang.org/x/net/http2"
 )
 
 const (
@@ -43,22 +37,6 @@ const (
 
 // quicSessionCache enables TLS session resumption across QUIC reconnects (1-RTT, not 0-RTT).
 var quicSessionCache = tls.NewLRUClientSessionCache(8)
-
-// taggedEndpoint pairs a resolved UDP address with a label for logging.
-type taggedEndpoint struct {
-	addr *net.UDPAddr
-	tag  string
-}
-
-// connResult holds the outcome of a single tunnel connection attempt.
-type connResult struct {
-	udpConn *net.UDPConn
-	tr      *http3.Transport
-	ipConn  *connectip.Conn
-	rsp     *http.Response
-	err     error
-	tag     string
-}
 
 // tunnelConfig extends config.Config with optional tunnel parameters.
 type tunnelConfig struct {
@@ -88,12 +66,6 @@ func (t *tunnelConfig) connectUri() string {
 		return t.ConnectURI
 	}
 	return defaultURI
-}
-
-// VpnProtector is implemented by Android's VpnService to protect sockets
-// from being routed through the VPN tunnel.
-type VpnProtector interface {
-	ProtectFd(fd int) bool
 }
 
 // TunnelListener receives tunnel state, stats, and error callbacks from Go.
@@ -154,22 +126,7 @@ func notifyError(err string) {
 	})
 }
 
-// FdAdapter wraps an OS file descriptor (from Android's VpnService TUN) to
-// satisfy usque's api.TunnelDevice interface.
-type FdAdapter struct {
-	file *os.File
-}
-
-func (f *FdAdapter) ReadPacket(buf []byte) (int, error) {
-	return f.file.Read(buf)
-}
-
-func (f *FdAdapter) WritePacket(pkt []byte) error {
-	_, err := f.file.Write(pkt)
-	return err
-}
-
-// dnsQueryPool reuses buffers for DNS query copies in forwardUp, reducing GC pressure.
+// dnsQueryPool reuses buffers for DNS query copies, reducing GC pressure.
 var dnsQueryPool = sync.Pool{
 	New: func() any {
 		buf := make([]byte, 0, 512) // typical DNS query size
@@ -179,25 +136,19 @@ var dnsQueryPool = sync.Pool{
 
 // tunnel state
 var (
-	mu           sync.Mutex
-	cancel       context.CancelFunc
-	running      atomic.Bool
-	connected    atomic.Bool   // true when MASQUE tunnel is forwarding traffic
-	done         chan struct{} // closed when maintainTunnel returns
-	reconnectCh  chan struct{}
-	networkCh    chan struct{} // signaled by SetConnectivity(true) to wake waitForNetwork
-	startTime    time.Time
-	connectedAt  atomic.Int64 // unix millis when last connected (0 if not connected)
-	txBytes      atomic.Int64
-	rxBytes      atomic.Int64
-	lastError    atomic.Value // string: last connection error message
-	hasNetwork   atomic.Bool  // set by Android via SetConnectivity
-	connectCount atomic.Int64 // number of connection attempts since StartTunnel
+	mu        sync.Mutex
+	cancel    context.CancelFunc
+	running   atomic.Bool
+	connected atomic.Bool // true when MASQUE tunnel is forwarding traffic
+	done      chan struct{}
+	startTime time.Time
+	txBytes   atomic.Int64
+	rxBytes   atomic.Int64
 )
 
 // StartTunnel starts the MASQUE tunnel. Blocks until StopTunnel or error.
 // If a previous tunnel is still winding down, waits up to 5s for it to finish.
-func StartTunnel(configJSON string, tunFd int, protector VpnProtector, listener TunnelListener) error {
+func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
 	mu.Lock()
 	if running.Load() {
 		d := done
@@ -224,19 +175,17 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector, listener 
 	}
 	config.AppConfig = tcfg.Config
 	config.ConfigLoaded = true
+	if tcfg.EndpointV4 == "" {
+		mu.Unlock()
+		return fmt.Errorf("no endpoint v4 in config")
+	}
 
 	ctx, c := context.WithCancel(context.Background())
 	cancel = c
 	done = make(chan struct{})
-	reconnectCh = make(chan struct{}, 1)
-	networkCh = make(chan struct{}, 1)
 	running.Store(true)
 	connected.Store(false)
-	hasNetwork.Store(true)
-	lastError.Store("")
 	startTime = time.Now()
-	connectedAt.Store(0)
-	connectCount.Store(0)
 	txBytes.Store(0)
 	rxBytes.Store(0)
 	mu.Unlock()
@@ -244,34 +193,148 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector, listener 
 	setListener(listener)
 	defer setListener(nil)
 
-	// The TUN fd is owned by the Java VpnService (ParcelFileDescriptor).
-	// Go must never close the original: wrapping it in os.File means the GC
-	// finalizer will close it whenever it runs, which races Java's close()
-	// and trips fdsan ("fd is owned by SocketImpl") once the fd number is
-	// reused — observed as a process abort during rapid start/stop/start.
-	// dup() gives Go an unowned copy that is safe to close deterministically.
+	// dup() gives Go an unowned copy of the TUN fd (fdsan fix, see spec).
 	dupFd, err := syscall.Dup(tunFd)
 	if err != nil {
 		return fmt.Errorf("dup tun fd: %w", err)
 	}
 	tunFile := os.NewFile(uintptr(dupFd), "tun")
-	defer tunFile.Close() // deterministic close of Go's copy
-	device := &FdAdapter{file: tunFile}
-
-	// On shutdown, unblock the TUN read in forwardUp. Java closing its
-	// original fd does not wake a read blocked on the dup — the tun device
-	// is only destroyed once BOTH fds are closed, which wakes the read with
-	// an error and lets maintainTunnel exit promptly.
+	defer tunFile.Close()
+	// On shutdown, unblock the TUN read in filterDevice.
 	go func() {
 		<-ctx.Done()
 		tunFile.Close()
 	}()
 
-	err = maintainTunnel(ctx, &tcfg, device, protector)
+	device := &filterDevice{file: tunFile}
+
+	// DNS interception (DoH, DoQ, or System DNS) or tunnel cache fallback.
+	if tcfg.DoHURL != "" {
+		device.dns = newDnsInterceptor(ctx, &tcfg)
+		if device.dns != nil {
+			defer device.dns.close()
+			log.Println("DNS interception enabled: all port 53 traffic via DoH")
+		}
+	} else if tcfg.DoQURL != "" {
+		device.dns = newDoqDnsInterceptor(ctx, tcfg.DoQURL)
+		if device.dns != nil {
+			defer device.dns.close()
+			log.Println("DNS interception enabled: all port 53 traffic via DoQ")
+		}
+	} else if len(tcfg.SystemDNS) > 0 {
+		device.dns = newSystemDnsInterceptor(ctx, tcfg.SystemDNS)
+		if device.dns != nil {
+			defer device.dns.close()
+			if tcfg.PrivateDNS {
+				log.Printf("System DNS interception enabled (Private DNS active): forwarding port-53 via sockets to %v", tcfg.SystemDNS)
+			} else {
+				log.Printf("System DNS interception enabled: forwarding via sockets to %v", tcfg.SystemDNS)
+			}
+		}
+	} else {
+		device.dnsCache = newTunnelDnsCache(512)
+		log.Println("DNS tunnel cache enabled")
+	}
+
+	// Userspace route exclusion (Android < 13): only set when exclude_prefixes
+	// arrive from Kotlin (API < 33 path).
+	if len(tcfg.ExcludePrefixes) > 0 {
+		df, derr := newDirectForwarder(tcfg.ExcludePrefixes, 1280, device.WritePacket)
+		if derr != nil {
+			log.Printf("Userspace route exclusion disabled: %v", derr)
+		} else if df != nil {
+			device.direct = df
+			defer df.close()
+			log.Printf("Userspace route exclusion enabled for %d prefixes", len(df.prefixes))
+		}
+	}
+
+	privKey, err := tcfg.GetEcPrivateKey()
+	if err != nil {
+		return fmt.Errorf("private key: %w", err)
+	}
+	peerPubKey, err := tcfg.GetEcEndpointPublicKey()
+	if err != nil {
+		return fmt.Errorf("endpoint public key: %w", err)
+	}
+	cert, err := selfSignedCert(privKey)
+	if err != nil {
+		return fmt.Errorf("cert generation: %w", err)
+	}
+	tlsCfg, err := api.PrepareTlsConfig(privKey, peerPubKey, cert, tcfg.sni(), false)
+	if err != nil {
+		return fmt.Errorf("TLS config: %w", err)
+	}
+	tlsCfg.ClientSessionCache = quicSessionCache
+
+	// Connected heuristic: upstream MaintainTunnel has no connect callback;
+	// report connected shortly after start if the loop is still alive
+	// (matches the reference usque-android pattern).
+	go func() {
+		select {
+		case <-time.After(3 * time.Second):
+			if running.Load() {
+				connected.Store(true)
+				notifyState("connected")
+				notifyStats()
+			}
+		case <-ctx.Done():
+		}
+	}()
+
+	// Stats ticker: one notifyStats() per ~5 min while connected.
+	statsTicker := time.NewTicker(5 * time.Minute)
+	defer statsTicker.Stop()
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-statsTicker.C:
+				if connected.Load() {
+					notifyStats()
+				}
+			}
+		}
+	}()
+
+	notifyState("connecting")
+	api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
+		TLSConfig:         tlsCfg,
+		KeepalivePeriod:   30 * time.Second,
+		InitialPacketSize: 1242,
+		Endpoint:          endpointFromConfig(&tcfg),
+		Device:            device,
+		MTU:               1280,
+		ReconnectDelay:    1 * time.Second,
+		AlwaysReconnect:   false,
+		UseHTTP2:          tcfg.UseHTTP2,
+	})
+
 	running.Store(false)
+	connected.Store(false)
 	notifyState("stopped")
 	close(done)
-	return err
+	return nil
+}
+
+// endpointFromConfig resolves the WARP endpoint. HTTP/2 uses TCP, H3 uses UDP.
+func endpointFromConfig(cfg *tunnelConfig) net.Addr {
+	hostport := net.JoinHostPort(cfg.EndpointV4, "443")
+	if cfg.UseHTTP2 {
+		addr, err := net.ResolveTCPAddr("tcp", hostport)
+		if err != nil {
+			log.Printf("resolve endpoint %q: %v", hostport, err)
+			return nil
+		}
+		return addr
+	}
+	addr, err := net.ResolveUDPAddr("udp", hostport)
+	if err != nil {
+		log.Printf("resolve endpoint %q: %v", hostport, err)
+		return nil
+	}
+	return addr
 }
 
 // StopTunnel cancels the running tunnel.
@@ -284,36 +347,6 @@ func StopTunnel() {
 	}
 }
 
-// SetConnectivity tells the tunnel whether the device has network.
-// When false, the reconnect loop sleeps instead of hammering failed dials.
-// Call from Kotlin: true on onAvailable, false on onLost (no active network).
-func SetConnectivity(networkAvailable bool) {
-	wasConnected := hasNetwork.Swap(networkAvailable)
-	if networkAvailable && !wasConnected {
-		// Wake waitForNetwork immediately (no polling needed)
-		select {
-		case networkCh <- struct{}{}:
-		default:
-		}
-		// Network restored — trigger reconnect to pick up the new network
-		Reconnect()
-	}
-}
-
-// Reconnect tears down the current QUIC connection but keeps the reconnect
-// loop alive so it re-establishes on the (possibly new) network.
-func Reconnect() {
-	mu.Lock()
-	ch := reconnectCh
-	mu.Unlock()
-	if ch != nil {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-	}
-}
-
 // IsRunning returns whether the tunnel is currently active.
 func IsRunning() bool {
 	return running.Load()
@@ -322,22 +355,14 @@ func IsRunning() bool {
 // GetStats returns JSON with tunnel statistics.
 func GetStats() string {
 	stats := map[string]interface{}{
-		"running":       running.Load(),
-		"connected":     connected.Load(),
-		"tx_bytes":      txBytes.Load(),
-		"rx_bytes":      rxBytes.Load(),
-		"uptime_sec":    0,
-		"has_network":   hasNetwork.Load(),
-		"connect_count": connectCount.Load(),
-	}
-	if e, ok := lastError.Load().(string); ok && e != "" {
-		stats["last_error"] = e
+		"running":    running.Load(),
+		"connected":  connected.Load(),
+		"tx_bytes":   txBytes.Load(),
+		"rx_bytes":   rxBytes.Load(),
+		"uptime_sec": 0,
 	}
 	if running.Load() {
 		stats["uptime_sec"] = int(time.Since(startTime).Seconds())
-	}
-	if t := connectedAt.Load(); t > 0 {
-		stats["connected_since_ms"] = t
 	}
 	b, _ := json.Marshal(stats)
 	return string(b)
@@ -464,538 +489,6 @@ func cleanEndpoint(ep string) string {
 	return ep
 }
 
-// maintainTunnel reconnects in a loop. We can't use api.MaintainTunnel
-// directly because it calls ConnectTunnel without a protect() hook.
-func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDevice, protector VpnProtector) error {
-	const (
-		mtu             = 1280
-		connectPort     = 443
-		reconnectDelay  = 1 * time.Second
-		certRenewBefore = 1 * time.Hour // renew cert 1h before expiry
-	)
-
-	privKey, err := cfg.GetEcPrivateKey()
-	if err != nil {
-		return fmt.Errorf("private key: %w", err)
-	}
-	peerPubKey, err := cfg.GetEcEndpointPublicKey()
-	if err != nil {
-		return fmt.Errorf("endpoint public key: %w", err)
-	}
-
-	pool := api.NewNetBuffer(mtu)
-
-	// Create DNS interceptor (DoH, DoQ, or System DNS) or tunnel DNS cache (fallback).
-	// In System DNS mode the interceptor forwards port-53 traffic via protected
-	// UDP sockets so DNS packets never enter the QUIC tunnel — even when Android
-	// Private DNS (DoT) is active, since apps may bypass the OS resolver and
-	// emit port-53 directly.
-	var dns *dnsInterceptor
-	var dnsCache *tunnelDnsCache
-	if cfg.DoHURL != "" {
-		dns = newDnsInterceptor(ctx, cfg)
-		if dns != nil {
-			defer dns.close()
-			log.Println("DNS interception enabled: all port 53 traffic via DoH")
-		}
-	} else if cfg.DoQURL != "" {
-		dns = newDoqDnsInterceptor(ctx, cfg.DoQURL)
-		if dns != nil {
-			defer dns.close()
-			log.Println("DNS interception enabled: all port 53 traffic via DoQ")
-		}
-	} else if len(cfg.SystemDNS) > 0 {
-		dns = newSystemDnsInterceptor(ctx, cfg.SystemDNS)
-		if dns != nil {
-			defer dns.close()
-			if cfg.PrivateDNS {
-				log.Printf("System DNS interception enabled (Private DNS active): forwarding port-53 via protected sockets to %v", cfg.SystemDNS)
-			} else {
-				log.Printf("System DNS interception enabled: forwarding via protected sockets to %v", cfg.SystemDNS)
-			}
-		}
-	} else {
-		dnsCache = newTunnelDnsCache(512)
-		log.Println("DNS tunnel cache enabled")
-	}
-
-	// Userspace route exclusion (Android < 13): the framework has no
-	// excludeRoute below API 33, so packets to excluded prefixes still arrive
-	// on the TUN; hand them to a local gVisor stack that relays them via
-	// protected sockets. On API 33+ the kernel excludes the routes, no
-	// packets match, and the forwarder stays nil.
-	var direct *directForwarder
-	if len(cfg.ExcludePrefixes) > 0 {
-		df, derr := newDirectForwarder(cfg.ExcludePrefixes, mtu, device.WritePacket)
-		if derr != nil {
-			log.Printf("Userspace route exclusion disabled: %v", derr)
-		} else if df != nil {
-			direct = df
-			defer df.close()
-			log.Printf("Userspace route exclusion enabled for %d prefixes", len(df.prefixes))
-		}
-	}
-
-	// Certificate cache: generate once, reuse until near expiry.
-	var cachedCert [][]byte
-	var certExpiry time.Time
-	var waitForTraffic bool  // after error disconnect, wait for outbound traffic before reconnecting
-	var forcedReconnect bool // true when reconnect was explicitly requested (skip backoff delay)
-
-	// Stats ticker: one notifyStats() per ~5 min while connected. Created once
-	// (not per reconnect iteration) so reconnect cycles don't stack goroutines.
-	statsTicker := time.NewTicker(5 * time.Minute)
-	defer statsTicker.Stop()
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-statsTicker.C:
-				if connected.Load() {
-					notifyStats()
-				}
-			}
-		}
-	}()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		default:
-		}
-
-		// Only reconnect when there is actual outbound traffic waiting.
-		// Prevents wasteful reconnects during idle periods.
-		// ReadPacket is blocking, so run it in a goroutine and select on
-		// reconnectCh too — otherwise a forced reconnect (network change)
-		// can't wake us when the app is in background with no outbound traffic.
-		if waitForTraffic {
-			log.Println("Tunnel idle. Waiting for outbound activity before reconnecting...")
-			type readResult struct {
-				n   int
-				err error
-			}
-			readCh := make(chan readResult, 1)
-			buf := pool.Get()
-			go func() {
-				n, err := device.ReadPacket(buf)
-				pool.Put(buf)
-				readCh <- readResult{n, err}
-			}()
-
-			select {
-			case r := <-readCh:
-				if r.err != nil {
-					if ctx.Err() != nil {
-						return nil
-					}
-					log.Printf("Failed to read from TUN while waiting for activity: %v", r.err)
-					sleepCtx(ctx, reconnectDelay)
-					continue
-				}
-				log.Printf("Detected outbound activity (%d bytes). Reconnecting...", r.n)
-			case <-reconnectCh:
-				log.Println("Reconnect signal received while idle — reconnecting immediately")
-				// Goroutine is still blocked on ReadPacket; it will complete when the
-				// next TUN packet arrives (fd stays open) and return buf to pool.
-			case <-ctx.Done():
-				// Goroutine will unblock when TUN fd is closed during shutdown.
-				return nil
-			}
-			waitForTraffic = false
-		}
-
-		// Reuse cached cert if still valid; regenerate only when near expiry.
-		if cachedCert == nil || time.Now().After(certExpiry.Add(-certRenewBefore)) {
-			cert, err := selfSignedCert(privKey)
-			if err != nil {
-				lastError.Store(err.Error())
-				notifyError(err.Error())
-				log.Printf("cert generation: %v", err)
-				sleepCtx(ctx, reconnectDelay)
-				continue
-			}
-			cachedCert = cert
-			certExpiry = time.Now().Add(24 * time.Hour)
-		}
-
-		tlsCfg, err := api.PrepareTlsConfig(privKey, peerPubKey, cachedCert, cfg.sni(), false)
-		if err != nil {
-			lastError.Store(err.Error())
-			notifyError(err.Error())
-			log.Printf("TLS config: %v", err)
-			sleepCtx(ctx, reconnectDelay)
-			continue
-		}
-
-		tlsCfg.ClientSessionCache = quicSessionCache // 1-RTT session resumption (not 0-RTT)
-
-		connectCount.Add(1)
-		notifyState("connecting")
-		var udpConn *net.UDPConn
-		var tr *http3.Transport
-		var ipConn *connectip.Conn
-		var rsp *http.Response
-
-		if cfg.UseHTTP2 {
-			// HTTP/2 (TCP) path
-			var tcpEndpoint *net.TCPAddr
-			if ip := net.ParseIP(cfg.EndpointV4); ip != nil {
-				tcpEndpoint = &net.TCPAddr{IP: ip, Port: connectPort}
-			} else if ip := net.ParseIP(cfg.EndpointV6); ip != nil {
-				tcpEndpoint = &net.TCPAddr{IP: ip, Port: connectPort}
-			}
-			if tcpEndpoint == nil {
-				lastError.Store("no valid endpoints for HTTP/2")
-				notifyError("no valid endpoints for HTTP/2")
-				log.Println("no valid endpoints for HTTP/2")
-				sleepCtx(ctx, reconnectDelay)
-				continue
-			}
-			log.Printf("Connecting via HTTP/2 to %s", tcpEndpoint)
-			ipConn, rsp, err = connectTunnelProtectedH2(ctx, tlsCfg, tcpEndpoint, cfg.connectUri(), protector)
-		} else {
-			// HTTP/3 (QUIC/UDP) path
-			quicCfg := &quic.Config{
-				EnableDatagrams: true,
-				KeepAlivePeriod: 30 * time.Second,
-				MaxIdleTimeout:  120 * time.Second,
-			}
-			udpConn, tr, ipConn, rsp, err = connectHappyEyeballs(
-				ctx, tlsCfg, quicCfg,
-				cfg.EndpointV4, cfg.EndpointV6,
-				connectPort, cfg.connectUri(), protector,
-			)
-		}
-
-		if err != nil {
-			lastError.Store(err.Error())
-			notifyError(err.Error())
-			log.Printf("connect: %v", err)
-			if !hasNetwork.Load() {
-				log.Println("no network — waiting for connectivity")
-				waitForNetwork(ctx)
-			} else {
-				sleepCtx(ctx, reconnectDelay)
-			}
-			continue
-		}
-		if rsp.StatusCode != 200 {
-			lastError.Store(fmt.Sprintf("tunnel rejected: %s", rsp.Status))
-			notifyError(fmt.Sprintf("tunnel rejected: %s", rsp.Status))
-			log.Printf("tunnel rejected: %s", rsp.Status)
-			cleanup(ipConn, udpConn, tr)
-			sleepCtx(ctx, reconnectDelay)
-			continue
-		}
-
-		connected.Store(true)
-		connectedAt.Store(time.Now().UnixMilli())
-		lastError.Store("")
-		log.Println("Connected to MASQUE server")
-		notifyState("connected")
-		notifyStats()
-
-		errChan := make(chan error, 2)
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, dnsCache, direct) }()
-		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache, cfg.UseHTTP2) }()
-
-		forcedReconnect = false
-		select {
-		case err = <-errChan:
-			connected.Store(false)
-			notifyState("disconnected")
-			connectedAt.Store(0)
-			lastError.Store(err.Error())
-			log.Printf("tunnel lost: %v", err)
-			waitForTraffic = true // wait for outbound traffic before reconnecting
-		case <-reconnectCh:
-			connected.Store(false)
-			notifyState("disconnected")
-			connectedAt.Store(0)
-			log.Println("reconnect requested")
-			waitForTraffic = false
-			forcedReconnect = true
-			// Reset DNS immediately so in-flight queries on stale connections
-			// fail fast instead of waiting for network timeouts.
-			if dns != nil {
-				dns.resetConnections()
-			}
-		case <-ctx.Done():
-			connected.Store(false)
-			notifyState("disconnected")
-			connectedAt.Store(0)
-		}
-
-		cleanup(ipConn, udpConn, tr)
-		// Wait for forwarding goroutines, but don't block forever:
-		// forwardUp may be stuck on device.ReadPacket if no TUN traffic.
-		wgDone := make(chan struct{})
-		go func() { wg.Wait(); close(wgDone) }()
-		select {
-		case <-wgDone:
-		case <-time.After(2 * time.Second):
-			log.Println("forwarders slow to stop, proceeding with reconnect")
-		}
-		if ctx.Err() != nil {
-			return nil
-		}
-
-		// Reset DNS on error path too (errChan case doesn't reset above)
-		if waitForTraffic && dns != nil {
-			dns.resetConnections()
-		}
-
-		// Only backoff-sleep after error disconnects, not forced reconnects
-		if !waitForTraffic && !forcedReconnect {
-			sleepCtx(ctx, reconnectDelay)
-		}
-	}
-}
-
-// connectHappyEyeballs implements Happy Eyeballs v3 (RFC 8305 / draft-ietf-happy-happyeyeballs-v3)
-// for the QUIC/Connect-IP tunnel connection. It races IPv6 and IPv4 with a
-// 250ms staggered delay, preferring IPv6 per the spec.
-func connectHappyEyeballs(
-	ctx context.Context,
-	tlsConfig *tls.Config,
-	quicConfig *quic.Config,
-	endpointV4, endpointV6 string,
-	connectPort int,
-	connectUri string,
-	protector VpnProtector,
-) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
-	const connectionAttemptDelay = 150 * time.Millisecond
-
-	// Build ordered endpoint list: IPv6 first, then IPv4.
-	var endpoints []taggedEndpoint
-	if ip := net.ParseIP(endpointV6); ip != nil {
-		endpoints = append(endpoints, taggedEndpoint{&net.UDPAddr{IP: ip, Port: connectPort}, "IPv6"})
-	}
-	if ip := net.ParseIP(endpointV4); ip != nil {
-		endpoints = append(endpoints, taggedEndpoint{&net.UDPAddr{IP: ip, Port: connectPort}, "IPv4"})
-	}
-
-	if len(endpoints) == 0 {
-		return nil, nil, nil, nil, errors.New("no valid endpoints configured")
-	}
-
-	// Single endpoint — no racing needed.
-	if len(endpoints) == 1 {
-		ep := endpoints[0]
-		log.Printf("Connecting to %s (%s)", ep.addr, ep.tag)
-		udpConn, tr, ipConn, rsp, err := connectTunnelProtected(ctx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
-		if err != nil {
-			if udpConn != nil {
-				udpConn.Close()
-			}
-			return nil, nil, nil, nil, err
-		}
-		return udpConn, tr, ipConn, rsp, nil
-	}
-
-	// Dual-stack: race with staggered start.
-	raceCtx, raceCancel := context.WithCancel(ctx)
-	defer raceCancel()
-
-	ch := make(chan connResult, 2)
-
-	attempt := func(ep taggedEndpoint) {
-		log.Printf("Connecting to %s (%s)", ep.addr, ep.tag)
-		udpConn, tr, ipConn, rsp, err := connectTunnelProtected(raceCtx, tlsConfig, quicConfig, ep.addr, connectUri, protector)
-		r := connResult{udpConn: udpConn, tr: tr, ipConn: ipConn, rsp: rsp, err: err, tag: ep.tag}
-		// Treat non-200 as failure for racing purposes.
-		if err == nil && rsp.StatusCode != 200 {
-			r.err = fmt.Errorf("tunnel rejected: %s", rsp.Status)
-		}
-		ch <- r
-	}
-
-	// Start first attempt (IPv6) immediately.
-	go attempt(endpoints[0])
-
-	// Wait for delay or first failure before starting second attempt.
-	timer := time.NewTimer(connectionAttemptDelay)
-	defer timer.Stop()
-
-	remaining := 0
-	select {
-	case r := <-ch:
-		if r.err == nil {
-			// First attempt won — no need to start second.
-			return r.udpConn, r.tr, r.ipConn, r.rsp, nil
-		}
-		// First attempt failed — start fallback immediately.
-		log.Printf("%s failed: %v", r.tag, r.err)
-		if r.udpConn != nil {
-			r.udpConn.Close()
-		}
-		go attempt(endpoints[1])
-		remaining = 1 // only the fallback is in flight
-	case <-timer.C:
-		// Delay expired — start second attempt in parallel.
-		go attempt(endpoints[1])
-		remaining = 2 // both attempts in flight
-	case <-ctx.Done():
-		return nil, nil, nil, nil, ctx.Err()
-	}
-
-	// Collect results from in-flight attempts.
-	var lastErr error
-	for i := 0; i < remaining; i++ {
-		select {
-		case r := <-ch:
-			if r.err == nil {
-				// Winner — cancel the other attempt and return.
-				raceCancel()
-				return r.udpConn, r.tr, r.ipConn, r.rsp, nil
-			}
-			log.Printf("%s failed: %v", r.tag, r.err)
-			if r.udpConn != nil {
-				r.udpConn.Close()
-			}
-			lastErr = r.err
-		case <-ctx.Done():
-			return nil, nil, nil, nil, ctx.Err()
-		}
-	}
-	return nil, nil, nil, nil, lastErr
-}
-
-// connectTunnelProtected mirrors api.ConnectTunnel but protects the UDP
-// socket fd before QUIC handshake to prevent VPN routing loops.
-func connectTunnelProtected(
-	ctx context.Context,
-	tlsConfig *tls.Config,
-	quicConfig *quic.Config,
-	endpoint *net.UDPAddr,
-	connectUri string,
-	protector VpnProtector,
-) (*net.UDPConn, *http3.Transport, *connectip.Conn, *http.Response, error) {
-	// Create UDP socket
-	listenAddr := &net.UDPAddr{IP: net.IPv4zero, Port: 0}
-	if endpoint.IP.To4() == nil {
-		listenAddr = &net.UDPAddr{IP: net.IPv6zero, Port: 0}
-	}
-	udpConn, err := net.ListenUDP("udp", listenAddr)
-	if err != nil {
-		return nil, nil, nil, nil, fmt.Errorf("UDP socket: %w", err)
-	}
-
-	// Protect before QUIC handshake
-	rawConn, rawErr := udpConn.SyscallConn()
-	if rawErr != nil {
-		udpConn.Close()
-		return nil, nil, nil, nil, fmt.Errorf("raw conn: %w", rawErr)
-	}
-	var protectErr error
-	rawConn.Control(func(fd uintptr) {
-		if !protector.ProtectFd(int(fd)) {
-			protectErr = errors.New("VPN protect() failed")
-		}
-	})
-	if protectErr != nil {
-		udpConn.Close()
-		return nil, nil, nil, nil, protectErr
-	}
-
-	// QUIC + Connect-IP (mirrors api.ConnectTunnel logic)
-	conn, err := quic.Dial(ctx, udpConn, endpoint, tlsConfig, quicConfig)
-	if err != nil {
-		udpConn.Close()
-		return nil, nil, nil, nil, err
-	}
-
-	tr := &http3.Transport{
-		EnableDatagrams:    true,
-		AdditionalSettings: map[uint64]uint64{0x276: 1},
-		DisableCompression: true,
-	}
-	hconn := tr.NewClientConn(conn)
-	template := uritemplate.MustNew(connectUri)
-	headers := http.Header{"User-Agent": {""}}
-
-	ipConn, rsp, err := connectip.Dial(ctx, hconn, template, "cf-connect-ip", headers, true)
-	if err != nil {
-		_ = tr.Close()
-		_ = conn.CloseWithError(0, "connect-ip dial failed")
-		udpConn.Close()
-		if strings.Contains(err.Error(), "tls: access denied") {
-			return nil, nil, nil, nil, errors.New("login failed: TLS key/cert not enrolled in Cloudflare Access")
-		}
-		return nil, nil, nil, nil, fmt.Errorf("connect-ip: %v", err)
-	}
-	return udpConn, tr, ipConn, rsp, nil
-}
-
-// connectTunnelProtectedH2 establishes a Connect-IP tunnel over HTTP/2 (TCP).
-// Protects the TCP socket from VPN routing before the TLS handshake.
-func connectTunnelProtectedH2(
-	ctx context.Context,
-	tlsConfig *tls.Config,
-	endpoint *net.TCPAddr,
-	connectUri string,
-	protector VpnProtector,
-) (*connectip.Conn, *http.Response, error) {
-	h2TlsConfig := tlsConfig.Clone()
-	h2TlsConfig.NextProtos = []string{"h2"}
-
-	transport := &http2.Transport{
-		DialTLSContext: func(ctx context.Context, network, _ string, _ *tls.Config) (net.Conn, error) {
-			dialer := &net.Dialer{Timeout: 10 * time.Second}
-			conn, err := dialer.DialContext(ctx, network, endpoint.String())
-			if err != nil {
-				return nil, err
-			}
-			// Protect TCP socket from VPN routing
-			if tc, ok := conn.(*net.TCPConn); ok {
-				raw, rawErr := tc.SyscallConn()
-				if rawErr == nil {
-					var protectErr error
-					raw.Control(func(fd uintptr) {
-						if !protector.ProtectFd(int(fd)) {
-							protectErr = errors.New("VPN protect() failed on TCP socket")
-						}
-					})
-					if protectErr != nil {
-						conn.Close()
-						return nil, protectErr
-					}
-				}
-			}
-			tlsConn := tls.Client(conn, h2TlsConfig)
-			if err := tlsConn.HandshakeContext(ctx); err != nil {
-				conn.Close()
-				return nil, err
-			}
-			return tlsConn, nil
-		},
-	}
-
-	h2Client := &http.Client{Transport: transport}
-
-	template := uritemplate.MustNew(connectUri)
-	headers := http.Header{
-		"User-Agent":       {""},
-		"cf-connect-proto": {"cf-connect-ip"},
-		"pq-enabled":       {"false"},
-	}
-
-	ipConn, rsp, err := connectip.DialH2(ctx, h2Client, template, headers)
-	if err != nil {
-		h2Client.CloseIdleConnections()
-		if strings.Contains(err.Error(), "tls: access denied") {
-			return nil, nil, errors.New("login failed: TLS key/cert not enrolled in Cloudflare Access")
-		}
-		return nil, nil, fmt.Errorf("connect-ip H2: %w", err)
-	}
-	return ipConn, rsp, nil
-}
-
 // isDNSQuery reports whether pkt looks like a DNS query (QR=0, opcode=0, QDCOUNT>=1).
 func isDNSQuery(pkt []byte) bool {
 	if len(pkt) < 12 {
@@ -1006,96 +499,6 @@ func isDNSQuery(pkt []byte) bool {
 	opcode := (flags >> 11) & 0xF
 	qdcount := uint16(pkt[4])<<8 | uint16(pkt[5])
 	return qr == 0 && opcode == 0 && qdcount >= 1
-}
-func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor, dnsCache *tunnelDnsCache, direct *directForwarder) {
-	for {
-		buf := pool.Get()
-		n, err := device.ReadPacket(buf)
-		if err != nil {
-			pool.Put(buf)
-			errChan <- err
-			return
-		}
-		pkt := buf[:n]
-		txBytes.Add(int64(n))
-
-		// Intercept DNS packets (IPv4 and IPv6)
-		if srcIP, srcPort, dstIP, query, isIPv6, ok := detectDNSQuery(pkt); ok && isDNSQuery(query) {
-			if dns != nil {
-				bufPtr := dnsQueryPool.Get().(*[]byte)
-				queryCopy := append((*bufPtr)[:0], query...)
-				pool.Put(buf)
-				dns.forwardUp(dnsRequest{
-					srcIP: srcIP, srcPort: srcPort, dstIP: dstIP,
-					query: queryCopy, writeFunc: device.WritePacket,
-					isIPv6: isIPv6, poolBuf: bufPtr,
-				})
-				continue
-			}
-			if dnsCache != nil && dnsCache.checkAndRespond(pkt, device.WritePacket) {
-				pool.Put(buf)
-				continue
-			}
-		}
-
-		// Userspace route exclusion: relay excluded-prefix traffic directly
-		// via protected sockets instead of through the tunnel.
-		if direct != nil && direct.shouldForward(pkt) {
-			direct.inject(pkt)
-			pool.Put(buf)
-			continue
-		}
-
-		// Send via Connect-IP datagrams (UDP, ICMP, TCP, etc.)
-		icmp, err := ipConn.WritePacket(pkt)
-		pool.Put(buf)
-		if err != nil {
-			if errors.As(err, new(*connectip.CloseError)) {
-				errChan <- fmt.Errorf("connection closed while writing to IP connection: %v", err)
-				return
-			}
-			log.Printf("Error writing to IP connection: %v, continuing...", err)
-			continue
-		}
-		if len(icmp) > 0 {
-			if err := device.WritePacket(icmp); err != nil {
-				if errors.As(err, new(*connectip.CloseError)) {
-					errChan <- fmt.Errorf("connection closed while writing ICMP to TUN device: %v", err)
-					return
-				}
-				log.Printf("Error writing ICMP to TUN device: %v, continuing...", err)
-			}
-		}
-	}
-}
-
-func forwardDown(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dnsCache *tunnelDnsCache, useHTTP2 bool) {
-	buf := pool.Get()
-	defer pool.Put(buf)
-	for {
-		n, err := ipConn.ReadPacket(buf, true)
-		if err != nil {
-			// HTTP/2: all read errors are fatal (TCP stream broken = connection gone)
-			if useHTTP2 {
-				errChan <- fmt.Errorf("connection closed while reading from IP connection: %v", err)
-				return
-			}
-			if errors.As(err, new(*connectip.CloseError)) {
-				errChan <- fmt.Errorf("connection closed while reading from IP connection: %v", err)
-				return
-			}
-			log.Printf("Error reading from IP connection: %v, continuing...", err)
-			continue
-		}
-		rxBytes.Add(int64(n))
-		if dnsCache != nil {
-			dnsCache.cacheResponse(buf[:n])
-		}
-		if err := device.WritePacket(buf[:n]); err != nil {
-			errChan <- err
-			return
-		}
-	}
 }
 
 func selfSignedCert(privKey *ecdsa.PrivateKey) ([][]byte, error) {
@@ -1112,43 +515,4 @@ func selfSignedCert(privKey *ecdsa.PrivateKey) ([][]byte, error) {
 		return nil, err
 	}
 	return [][]byte{der}, nil
-}
-
-func cleanup(ipConn *connectip.Conn, udpConn *net.UDPConn, tr *http3.Transport) {
-	if ipConn != nil {
-		ipConn.Close()
-	}
-	if udpConn != nil {
-		udpConn.Close()
-	}
-	if tr != nil {
-		tr.Close()
-	}
-}
-
-// waitForNetwork blocks until hasNetwork becomes true or ctx is cancelled.
-// Uses channel-based wakeup from SetConnectivity — no polling, zero CPU when idle.
-func waitForNetwork(ctx context.Context) {
-	// Drain any stale signal from a previous SetConnectivity(true) that was
-	// buffered while connected — prevents instant false return.
-	select {
-	case <-networkCh:
-	default:
-	}
-	if hasNetwork.Load() {
-		return
-	}
-	select {
-	case <-ctx.Done():
-	case <-networkCh:
-	}
-}
-
-func sleepCtx(ctx context.Context, d time.Duration) {
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-	case <-timer.C:
-	}
 }
