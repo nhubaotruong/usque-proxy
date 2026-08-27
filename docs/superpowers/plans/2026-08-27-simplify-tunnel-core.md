@@ -355,7 +355,7 @@ func TestGetStatsShape(t *testing.T) {
 }
 ```
 
-2. `TestStartTunnelInvalidConfig` — new signature (protector arg gone):
+1. `TestStartTunnelInvalidConfig` — new signature (protector arg gone):
 
 ```go
 func TestStartTunnelInvalidConfig(t *testing.T) {
@@ -410,10 +410,10 @@ func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
  }
  config.AppConfig = tcfg.Config
  config.ConfigLoaded = true
-	if tcfg.EndpointV4 == "" {
-		mu.Unlock()
-		return fmt.Errorf("no endpoint v4 in config")
-	}
+ if tcfg.EndpointV4 == "" {
+  mu.Unlock()
+  return fmt.Errorf("no endpoint v4 in config")
+ }
 
  ctx, c := context.WithCancel(context.Background())
  cancel = c
@@ -533,8 +533,8 @@ func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
   }
  }()
 
-	notifyState("connecting")
-	api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
+ notifyState("connecting")
+ api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
   TLSConfig:         tlsCfg,
   KeepalivePeriod:   30 * time.Second,
   InitialPacketSize: 1242,
