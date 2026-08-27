@@ -185,6 +185,39 @@ func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
 		return fmt.Errorf("invalid endpoint: %s", tcfg.EndpointV4)
 	}
 
+	// Fallible prep runs before the state commit below: after running is set,
+	// no error returns may occur (each would wedge state permanently).
+	// dup() gives Go an unowned copy of the TUN fd (fdsan fix, see spec).
+	dupFd, err := syscall.Dup(tunFd)
+	if err != nil {
+		mu.Unlock()
+		return fmt.Errorf("dup tun fd: %w", err)
+	}
+	tunFile := os.NewFile(uintptr(dupFd), "tun")
+	defer tunFile.Close()
+
+	privKey, err := tcfg.GetEcPrivateKey()
+	if err != nil {
+		mu.Unlock()
+		return fmt.Errorf("private key: %w", err)
+	}
+	peerPubKey, err := tcfg.GetEcEndpointPublicKey()
+	if err != nil {
+		mu.Unlock()
+		return fmt.Errorf("endpoint public key: %w", err)
+	}
+	cert, err := selfSignedCert(privKey)
+	if err != nil {
+		mu.Unlock()
+		return fmt.Errorf("cert generation: %w", err)
+	}
+	tlsCfg, err := api.PrepareTlsConfig(privKey, peerPubKey, cert, tcfg.sni(), false)
+	if err != nil {
+		mu.Unlock()
+		return fmt.Errorf("TLS config: %w", err)
+	}
+	tlsCfg.ClientSessionCache = quicSessionCache
+
 	ctx, c := context.WithCancel(context.Background())
 	cancel = c
 	done = make(chan struct{})
@@ -198,13 +231,6 @@ func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
 	setListener(listener)
 	defer setListener(nil)
 
-	// dup() gives Go an unowned copy of the TUN fd (fdsan fix, see spec).
-	dupFd, err := syscall.Dup(tunFd)
-	if err != nil {
-		return fmt.Errorf("dup tun fd: %w", err)
-	}
-	tunFile := os.NewFile(uintptr(dupFd), "tun")
-	defer tunFile.Close()
 	// On shutdown, unblock the TUN read in filterDevice.
 	go func() {
 		<-ctx.Done()
@@ -253,24 +279,6 @@ func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
 			log.Printf("Userspace route exclusion enabled for %d prefixes", len(df.prefixes))
 		}
 	}
-
-	privKey, err := tcfg.GetEcPrivateKey()
-	if err != nil {
-		return fmt.Errorf("private key: %w", err)
-	}
-	peerPubKey, err := tcfg.GetEcEndpointPublicKey()
-	if err != nil {
-		return fmt.Errorf("endpoint public key: %w", err)
-	}
-	cert, err := selfSignedCert(privKey)
-	if err != nil {
-		return fmt.Errorf("cert generation: %w", err)
-	}
-	tlsCfg, err := api.PrepareTlsConfig(privKey, peerPubKey, cert, tcfg.sni(), false)
-	if err != nil {
-		return fmt.Errorf("TLS config: %w", err)
-	}
-	tlsCfg.ClientSessionCache = quicSessionCache
 
 	// Connected heuristic: upstream MaintainTunnel has no connect callback;
 	// report connected shortly after start if the loop is still alive
