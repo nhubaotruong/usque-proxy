@@ -3,6 +3,7 @@ package com.nhubaotruong.usqueproxy
 import android.content.Intent
 import android.net.VpnService
 import android.os.Bundle
+import android.os.StrictMode
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -16,6 +17,7 @@ import com.nhubaotruong.usqueproxy.data.ThemeMode
 import com.nhubaotruong.usqueproxy.ui.nav.AppNavigation
 import com.nhubaotruong.usqueproxy.ui.theme.UsqueProxyTheme
 import com.nhubaotruong.usqueproxy.ui.viewmodel.VpnViewModel
+import com.nhubaotruong.usqueproxy.vpn.TunnelStateHolder
 import com.nhubaotruong.usqueproxy.vpn.UsqueVpnService
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
@@ -39,6 +41,15 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        if (BuildConfig.DEBUG) {
+            StrictMode.setThreadPolicy(
+                StrictMode.ThreadPolicy.Builder().detectAll().penaltyLog().build()
+            )
+            StrictMode.setVmPolicy(
+                StrictMode.VmPolicy.Builder().detectAll().penaltyLog().build()
+            )
+        }
         setContent {
             val prefs by vpnViewModel.vpnPrefs.collectAsStateWithLifecycle()
             val darkTheme = when (prefs.themeMode) {
@@ -56,7 +67,7 @@ class MainActivity : ComponentActivity() {
         handleConnectAction(intent)
 
         // Auto-connect on app start if enabled
-        if (intent?.action != ACTION_CONNECT_VPN && !UsqueVpnService.isRunning) {
+        if (intent?.action != ACTION_CONNECT_VPN && !TunnelStateHolder.isRunning) {
             lifecycleScope.launch {
                 val prefs = vpnViewModel.vpnPrefs.first { it.isActiveRegistered || !it.autoConnect }
                 if (prefs.autoConnect && prefs.isActiveRegistered && prefs.activeConfigJson.isNotEmpty()) {

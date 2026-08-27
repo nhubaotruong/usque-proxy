@@ -9,6 +9,9 @@
 -keep class usquebind.** { *; }
 -keep interface usquebind.** { *; }
 
+# gomobile-generated JNI classes — R8 must not strip or rename them
+-keep class go.** { *; }
+
 # Keep VPN service (referenced from AndroidManifest.xml)
 -keep class com.nhubaotruong.usqueproxy.vpn.UsqueVpnService { *; }
 
