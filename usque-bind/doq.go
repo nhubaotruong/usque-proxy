@@ -214,10 +214,6 @@ func newDoqDnsInterceptor(ctx context.Context, doqAddr string) *dnsInterceptor {
 	d := &dnsInterceptor{
 		resolver: doq.resolve,
 		reqCh:    make(chan dnsRequest, 256),
-		resetFunc: func() {
-			doq.resetConn()
-			doq.warmConnection()
-		},
 	}
 	d.startWorkers(ctx, 4)
 

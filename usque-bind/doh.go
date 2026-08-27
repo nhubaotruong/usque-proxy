@@ -657,9 +657,8 @@ type dnsRequest struct {
 
 // dnsInterceptor intercepts all port 53 traffic and resolves via DoH.
 type dnsInterceptor struct {
-	resolver  func(query []byte) ([]byte, error)
-	reqCh     chan dnsRequest
-	resetFunc func() // called on network change to discard stale connections
+	resolver func(query []byte) ([]byte, error)
+	reqCh    chan dnsRequest
 }
 
 // newDnsInterceptor creates a dnsInterceptor that resolves all DNS via DoH.
@@ -675,10 +674,7 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig) *dnsInterceptor {
 	d := &dnsInterceptor{
 		resolver: doh.resolve,
 		reqCh:    make(chan dnsRequest, 256),
-		resetFunc: func() {
-			doh.resetClient()
-			doh.warmConnection()
-		},
+		// DNS recovery is reactive-only now: clients reset on retryable errors after a network switch; proactive resetConnections was removed with the custom tunnel loop.
 	}
 	d.startWorkers(ctx, 4)
 
@@ -802,13 +798,6 @@ func (d *dnsInterceptor) forwardUp(req dnsRequest) {
 
 // close is a no-op (DoH client is GC'd with the interceptor).
 func (d *dnsInterceptor) close() {}
-
-// resetConnections discards stale DNS connections after a network change.
-func (d *dnsInterceptor) resetConnections() {
-	if d.resetFunc != nil {
-		d.resetFunc()
-	}
-}
 
 // handleInterceptedDNS resolves a DNS query and writes the response packet back.
 func (d *dnsInterceptor) handleInterceptedDNS(req dnsRequest) {

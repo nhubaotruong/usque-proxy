@@ -185,6 +185,20 @@ func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
 		return fmt.Errorf("invalid endpoint: %s", tcfg.EndpointV4)
 	}
 
+	// Upstream api.MaintainTunnel log.Fatalf's (kills the process) if the
+	// endpoint's concrete type doesn't match UseHTTP2; assert the invariant here.
+	if tcfg.UseHTTP2 {
+		if _, ok := ep.(*net.TCPAddr); !ok {
+			mu.Unlock()
+			return fmt.Errorf("endpoint type mismatch: HTTP/2 requires TCP, got %T", ep)
+		}
+	} else {
+		if _, ok := ep.(*net.UDPAddr); !ok {
+			mu.Unlock()
+			return fmt.Errorf("endpoint type mismatch: HTTP/3 requires UDP, got %T", ep)
+		}
+	}
+
 	// Fallible prep runs before the state commit below: after running is set,
 	// no error returns may occur (each would wedge state permanently).
 	// dup() gives Go an unowned copy of the TUN fd (fdsan fix, see spec).
@@ -313,7 +327,11 @@ func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
 
 	notifyState("connecting")
 	api.MaintainTunnel(ctx, api.MaintainTunnelConfig{
-		TLSConfig:         tlsCfg,
+		TLSConfig: tlsCfg,
+		// MaxIdleTimeout is intentionally NOT set: quic-go's default (30s)
+		// applies, matching the reference usque-android. Silent-death
+		// detection is ~30-60s, but stall tolerance dropped 4x vs the old
+		// explicit 120s.
 		KeepalivePeriod:   30 * time.Second,
 		InitialPacketSize: 1242,
 		Endpoint:          ep,
