@@ -9,6 +9,7 @@ import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.net.VpnService
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
@@ -163,7 +164,10 @@ class UsqueVpnService : VpnService(), TunnelListener {
             intent.action == ACTION_RESTART -> {
                 startForeground(VpnNotification.NOTIFICATION_ID, notification.buildConnecting())
                 serviceScope.launch {
-                    stopVpnInternal()
+                    // Keep the service alive across the restart: stopSelf() inside
+                    // stopVpnInternal() would destroy it and cancel this scope before
+                    // launchStartJob() runs, leaving the VPN dead.
+                    stopVpnInternal(stopService = false)
                     yield() // allow cancellation between stop and start
                     launchStartJob()
                 }
@@ -245,6 +249,12 @@ class UsqueVpnService : VpnService(), TunnelListener {
             Log.i(TAG, "Android Private DNS is active — system DNS queries may bypass tunnel DNS interception")
         }
 
+        // Excluded prefixes for userspace route exclusion on API < 33, where
+        // VpnService.Builder.excludeRoute does not exist (kernel exclusions
+        // are skipped there too). The Go tunnel relays matching traffic
+        // directly via protected sockets instead of through the VPN.
+        val excludePrefixes = mutableListOf<String>()
+
         // DNS
         val systemDns = systemDnsServersFrom(underlyingLp)
         when (prefs.dnsMode) {
@@ -256,7 +266,8 @@ class UsqueVpnService : VpnService(), TunnelListener {
                     runCatching {
                         val inet = java.net.InetAddress.getByName(addr)
                         val prefix = if (inet is java.net.Inet6Address) 128 else 32
-                        builder.excludeRoute(IpPrefix(inet, prefix))
+                        excludePrefixes += "$addr/$prefix"
+                        builder.excludeRouteCompat(inet, prefix)
                     }.onFailure { e ->
                         Log.w(TAG, "Failed to exclude DNS route $addr: ${e.message}")
                     }
@@ -276,7 +287,7 @@ class UsqueVpnService : VpnService(), TunnelListener {
             }
         }
 
-        val configJson = TunnelConfigBuilder.build(
+        var configJson = TunnelConfigBuilder.build(
             prefs,
             privateDnsActive = privateDnsActive,
             systemDns = systemDns,
@@ -288,7 +299,7 @@ class UsqueVpnService : VpnService(), TunnelListener {
         builder.addRoute("::", 0)
 
         if (prefs.bypassLocalNetwork) {
-            excludeLocalNetworks(builder)
+            excludeLocalNetworks(builder, excludePrefixes)
         }
 
         if (prefs.bypassOffice365) {
@@ -299,7 +310,8 @@ class UsqueVpnService : VpnService(), TunnelListener {
                     val parts = cidr.split("/")
                     val addr = java.net.InetAddress.getByName(parts[0])
                     val prefix = parts[1].toInt()
-                    builder.excludeRoute(android.net.IpPrefix(addr, prefix))
+                    builder.excludeRouteCompat(addr, prefix)
+                    excludePrefixes += cidr
                 }.onFailure { e ->
                     Log.w(TAG, "Failed to exclude O365 route $cidr: ${e.message}")
                 }
@@ -321,6 +333,21 @@ class UsqueVpnService : VpnService(), TunnelListener {
             }
             SplitMode.ALL -> {
                 runCatching { builder.addDisallowedApplication(packageName) }
+            }
+        }
+
+        // API < 33: the framework has no excludeRoute, so pass the excluded
+        // prefixes to the Go tunnel, which relays them directly via protected
+        // sockets (userspace route exclusion). On 33+ the kernel excludes the
+        // routes and no matching packets reach the TUN, so this is not needed.
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU && excludePrefixes.isNotEmpty()) {
+            runCatching {
+                val json = org.json.JSONObject(configJson)
+                json.put("exclude_prefixes", org.json.JSONArray(excludePrefixes))
+                configJson = json.toString()
+                Log.i(TAG, "Userspace route exclusion (${excludePrefixes.size} prefixes)")
+            }.onFailure { e ->
+                Log.w(TAG, "Failed to add exclude_prefixes to tunnel config: ${e.message}")
             }
         }
 
@@ -421,7 +448,7 @@ class UsqueVpnService : VpnService(), TunnelListener {
      * Performs full VPN shutdown. Serialized via [lifecycleMutex] to prevent
      * concurrent start/stop races.
      */
-    private suspend fun stopVpnInternal() {
+    private suspend fun stopVpnInternal(stopService: Boolean = true) {
         // Cancel startJob BEFORE acquiring mutex to avoid deadlock:
         // startJob holds mutex during setup, stop needs mutex for teardown.
         startJob?.cancel()
@@ -447,9 +474,11 @@ class UsqueVpnService : VpnService(), TunnelListener {
                 TunnelStateHolder.isRunning = false
                 TunnelStateHolder.emit(VpnServiceEvent.Stopped)
                 VpnTileService.requestUpdate(this)
-                withContext(Dispatchers.Main) {
-                    stopForeground(STOP_FOREGROUND_REMOVE)
-                    stopSelf()
+                if (stopService) {
+                    withContext(Dispatchers.Main) {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
                 }
             } finally {
                 isManagedShutdown = false
@@ -566,9 +595,9 @@ class UsqueVpnService : VpnService(), TunnelListener {
      * exact prefix length of the user's local network (e.g., /24) instead of
      * overly broad ranges (e.g., 192.168.0.0/16).
      */
-    private fun excludeLocalNetworks(builder: Builder) {
+    private fun excludeLocalNetworks(builder: Builder, excludePrefixes: MutableList<String>) {
         val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
-        val dynamicExclusions = mutableListOf<IpPrefix>()
+        val dynamicExclusions = mutableListOf<Pair<java.net.InetAddress, Int>>()
 
         // Discover actual local network subnets from all non-VPN networks
         // using NetworkCallback (allNetworks is deprecated since API 31)
@@ -597,7 +626,7 @@ class UsqueVpnService : VpnService(), TunnelListener {
                     if (addr.isLinkLocalAddress || addr.isSiteLocalAddress ||
                         addr.isLoopbackAddress || isPrivateAddress(addr)
                     ) {
-                        dynamicExclusions.add(IpPrefix(addr, prefix))
+                        dynamicExclusions.add(addr to prefix)
                     }
                 }
             }
@@ -606,17 +635,20 @@ class UsqueVpnService : VpnService(), TunnelListener {
         if (dynamicExclusions.isNotEmpty()) {
             Log.d(TAG, "Excluding ${dynamicExclusions.size} dynamically detected local networks")
             for (prefix in dynamicExclusions) {
-                runCatching { builder.excludeRoute(prefix) }
+                excludePrefixes += "${prefix.first.hostAddress}/${prefix.second}"
+                runCatching { builder.excludeRouteCompat(prefix.first, prefix.second) }
             }
         }
 
         // Always add static ranges for subnets we're not currently connected to
         // (e.g., other private ranges, multicast, broadcast)
         for ((addr, prefix) in LOCAL_NETWORK_EXCLUSIONS_V4) {
-            runCatching { builder.excludeRoute(IpPrefix(addr, prefix)) }
+            excludePrefixes += "${addr.hostAddress}/$prefix"
+            runCatching { builder.excludeRouteCompat(addr, prefix) }
         }
         for ((addr, prefix) in LOCAL_NETWORK_EXCLUSIONS_V6) {
-            runCatching { builder.excludeRoute(IpPrefix(addr, prefix)) }
+            excludePrefixes += "${addr.hostAddress}/$prefix"
+            runCatching { builder.excludeRouteCompat(addr, prefix) }
         }
     }
 
@@ -632,6 +664,20 @@ class UsqueVpnService : VpnService(), TunnelListener {
             return b[0].toInt() and 0xFE == 0xFC // fd00::/7 (ULA)
         }
         return false
+    }
+    /**
+     * excludeRoute exists only as excludeRoute(IpPrefix), which is API 33+ — the
+     * String/InetAddress overloads were removed from the platform before API 30
+     * (absent from stubs and runtime on API 30-32, verified against the API 30
+     * framework). So route exclusions are simply unavailable on API 30-32; skip
+     * them there. Fails soft (route not excluded) if a range is rejected.
+     */
+    private fun Builder.excludeRouteCompat(addr: java.net.InetAddress, prefixLength: Int) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            excludeRoute(IpPrefix(addr, prefixLength))
+        } else {
+            Log.d(TAG, "Route exclusion skipped (requires API 33+): $addr/$prefixLength")
+        }
     }
 
     /**

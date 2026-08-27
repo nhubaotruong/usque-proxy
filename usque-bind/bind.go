@@ -21,6 +21,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	connectip "github.com/Diniboy1123/connect-ip-go"
@@ -69,6 +70,10 @@ type tunnelConfig struct {
 	SystemDNS  []string `json:"system_dns"`
 	PrivateDNS bool     `json:"private_dns_active"`
 	UseHTTP2   bool     `json:"use_http2"`
+	// ExcludePrefixes lists CIDRs whose traffic is relayed directly via
+	// protected sockets (userspace route exclusion; Android API < 33, where
+	// VpnService.Builder.excludeRoute does not exist).
+	ExcludePrefixes []string `json:"exclude_prefixes"`
 }
 
 func (t *tunnelConfig) sni() string {
@@ -239,10 +244,30 @@ func StartTunnel(configJSON string, tunFd int, protector VpnProtector, listener 
 	setListener(listener)
 	defer setListener(nil)
 
-	tunFile := os.NewFile(uintptr(tunFd), "tun")
+	// The TUN fd is owned by the Java VpnService (ParcelFileDescriptor).
+	// Go must never close the original: wrapping it in os.File means the GC
+	// finalizer will close it whenever it runs, which races Java's close()
+	// and trips fdsan ("fd is owned by SocketImpl") once the fd number is
+	// reused — observed as a process abort during rapid start/stop/start.
+	// dup() gives Go an unowned copy that is safe to close deterministically.
+	dupFd, err := syscall.Dup(tunFd)
+	if err != nil {
+		return fmt.Errorf("dup tun fd: %w", err)
+	}
+	tunFile := os.NewFile(uintptr(dupFd), "tun")
+	defer tunFile.Close() // deterministic close of Go's copy
 	device := &FdAdapter{file: tunFile}
 
-	err := maintainTunnel(ctx, &tcfg, device, protector)
+	// On shutdown, unblock the TUN read in forwardUp. Java closing its
+	// original fd does not wake a read blocked on the dup — the tun device
+	// is only destroyed once BOTH fds are closed, which wakes the read with
+	// an error and lets maintainTunnel exit promptly.
+	go func() {
+		<-ctx.Done()
+		tunFile.Close()
+	}()
+
+	err = maintainTunnel(ctx, &tcfg, device, protector)
 	running.Store(false)
 	notifyState("stopped")
 	close(done)
@@ -494,6 +519,23 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		log.Println("DNS tunnel cache enabled")
 	}
 
+	// Userspace route exclusion (Android < 13): the framework has no
+	// excludeRoute below API 33, so packets to excluded prefixes still arrive
+	// on the TUN; hand them to a local gVisor stack that relays them via
+	// protected sockets. On API 33+ the kernel excludes the routes, no
+	// packets match, and the forwarder stays nil.
+	var direct *directForwarder
+	if len(cfg.ExcludePrefixes) > 0 {
+		df, derr := newDirectForwarder(cfg.ExcludePrefixes, mtu, protector, device.WritePacket)
+		if derr != nil {
+			log.Printf("Userspace route exclusion disabled: %v", derr)
+		} else if df != nil {
+			direct = df
+			defer df.close()
+			log.Printf("Userspace route exclusion enabled for %d prefixes", len(df.prefixes))
+		}
+	}
+
 	// Certificate cache: generate once, reuse until near expiry.
 	var cachedCert [][]byte
 	var certExpiry time.Time
@@ -659,7 +701,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 		errChan := make(chan error, 2)
 		var wg sync.WaitGroup
 		wg.Add(2)
-		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, dnsCache) }()
+		go func() { defer wg.Done(); forwardUp(device, ipConn, pool, errChan, dns, dnsCache, direct) }()
 		go func() { defer wg.Done(); forwardDown(device, ipConn, pool, errChan, dnsCache, cfg.UseHTTP2) }()
 
 		forcedReconnect = false
@@ -954,7 +996,7 @@ func isDNSQuery(pkt []byte) bool {
 	qdcount := uint16(pkt[4])<<8 | uint16(pkt[5])
 	return qr == 0 && opcode == 0 && qdcount >= 1
 }
-func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor, dnsCache *tunnelDnsCache) {
+func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuffer, errChan chan<- error, dns *dnsInterceptor, dnsCache *tunnelDnsCache, direct *directForwarder) {
 	for {
 		buf := pool.Get()
 		n, err := device.ReadPacket(buf)
@@ -983,6 +1025,14 @@ func forwardUp(device api.TunnelDevice, ipConn *connectip.Conn, pool *api.NetBuf
 				pool.Put(buf)
 				continue
 			}
+		}
+
+		// Userspace route exclusion: relay excluded-prefix traffic directly
+		// via protected sockets instead of through the tunnel.
+		if direct != nil && direct.shouldForward(pkt) {
+			direct.inject(pkt)
+			pool.Put(buf)
+			continue
 		}
 
 		// Send via Connect-IP datagrams (UDP, ICMP, TCP, etc.)
