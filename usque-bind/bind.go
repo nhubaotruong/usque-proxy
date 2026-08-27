@@ -493,19 +493,19 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	var dns *dnsInterceptor
 	var dnsCache *tunnelDnsCache
 	if cfg.DoHURL != "" {
-		dns = newDnsInterceptor(ctx, cfg, protector)
+		dns = newDnsInterceptor(ctx, cfg)
 		if dns != nil {
 			defer dns.close()
 			log.Println("DNS interception enabled: all port 53 traffic via DoH")
 		}
 	} else if cfg.DoQURL != "" {
-		dns = newDoqDnsInterceptor(ctx, cfg.DoQURL, protector)
+		dns = newDoqDnsInterceptor(ctx, cfg.DoQURL)
 		if dns != nil {
 			defer dns.close()
 			log.Println("DNS interception enabled: all port 53 traffic via DoQ")
 		}
 	} else if len(cfg.SystemDNS) > 0 {
-		dns = newSystemDnsInterceptor(ctx, cfg.SystemDNS, protector)
+		dns = newSystemDnsInterceptor(ctx, cfg.SystemDNS)
 		if dns != nil {
 			defer dns.close()
 			if cfg.PrivateDNS {
@@ -526,7 +526,7 @@ func maintainTunnel(ctx context.Context, cfg *tunnelConfig, device api.TunnelDev
 	// packets match, and the forwarder stays nil.
 	var direct *directForwarder
 	if len(cfg.ExcludePrefixes) > 0 {
-		df, derr := newDirectForwarder(cfg.ExcludePrefixes, mtu, protector, device.WritePacket)
+		df, derr := newDirectForwarder(cfg.ExcludePrefixes, mtu, device.WritePacket)
 		if derr != nil {
 			log.Printf("Userspace route exclusion disabled: %v", derr)
 		} else if df != nil {
@@ -887,9 +887,20 @@ func connectTunnelProtected(
 	}
 
 	// Protect before QUIC handshake
-	if err := protectUDPConn(udpConn, protector); err != nil {
+	rawConn, rawErr := udpConn.SyscallConn()
+	if rawErr != nil {
 		udpConn.Close()
-		return nil, nil, nil, nil, err
+		return nil, nil, nil, nil, fmt.Errorf("raw conn: %w", rawErr)
+	}
+	var protectErr error
+	rawConn.Control(func(fd uintptr) {
+		if !protector.ProtectFd(int(fd)) {
+			protectErr = errors.New("VPN protect() failed")
+		}
+	})
+	if protectErr != nil {
+		udpConn.Close()
+		return nil, nil, nil, nil, protectErr
 	}
 
 	// QUIC + Connect-IP (mirrors api.ConnectTunnel logic)
@@ -1113,21 +1124,6 @@ func cleanup(ipConn *connectip.Conn, udpConn *net.UDPConn, tr *http3.Transport) 
 	if tr != nil {
 		tr.Close()
 	}
-}
-
-// protectUDPConn marks a UDP socket as protected from VPN routing.
-func protectUDPConn(conn *net.UDPConn, protector VpnProtector) error {
-	rawConn, err := conn.SyscallConn()
-	if err != nil {
-		return fmt.Errorf("raw conn: %w", err)
-	}
-	var protectErr error
-	rawConn.Control(func(fd uintptr) {
-		if !protector.ProtectFd(int(fd)) {
-			protectErr = errors.New("VPN protect() failed")
-		}
-	})
-	return protectErr
 }
 
 // waitForNetwork blocks until hasNetwork becomes true or ctx is cancelled.

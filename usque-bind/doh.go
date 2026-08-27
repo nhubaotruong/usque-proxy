@@ -37,9 +37,9 @@ type dohProxy struct {
 	cachedResolver
 	url        string
 	client     *http.Client
-	clientMu   sync.Mutex           // protects client recreation
-	makeClient func() *http.Client  // factory for recreating client on network errors
-	preferGET  bool                 // flip to true on HTTP 405, stay on GET
+	clientMu   sync.Mutex          // protects client recreation
+	makeClient func() *http.Client // factory for recreating client on network errors
+	preferGET  bool                // flip to true on HTTP 405, stay on GET
 
 	// HTTP/3 support
 	h3Client     *http.Client
@@ -169,7 +169,7 @@ var warmupQuery = []byte{
 	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01,
 }
 
-func newDohProxy(url string, protector VpnProtector) *dohProxy {
+func newDohProxy(url string) *dohProxy {
 	makeClient := func() *http.Client {
 		dialer := &net.Dialer{Timeout: 5 * time.Second}
 		transport := &http.Transport{
@@ -187,20 +187,7 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 				ClientSessionCache:     globalTLSSessionCache,
 			},
 			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-				conn, err := dialer.DialContext(ctx, network, addr)
-				if err != nil {
-					return nil, err
-				}
-				// Protect the socket from VPN routing
-				if tc, ok := conn.(*net.TCPConn); ok {
-					raw, err := tc.SyscallConn()
-					if err == nil {
-						raw.Control(func(fd uintptr) {
-							protector.ProtectFd(int(fd))
-						})
-					}
-				}
-				return conn, nil
+				return dialer.DialContext(ctx, network, addr)
 			},
 		}
 
@@ -220,8 +207,8 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 		h3Transport := &http3.Transport{
 			DisableCompression: true,
 			TLSClientConfig: &tls.Config{
-				MinVersion:             tls.VersionTLS13,
-				ClientSessionCache:     globalTLSSessionCache,
+				MinVersion:         tls.VersionTLS13,
+				ClientSessionCache: globalTLSSessionCache,
 			},
 			Dial: func(ctx context.Context, addr string, tlsCfg *tls.Config, cfg *quic.Config) (*quic.Conn, error) {
 				udpAddr, err := net.ResolveUDPAddr("udp", addr)
@@ -234,11 +221,6 @@ func newDohProxy(url string, protector VpnProtector) *dohProxy {
 				}
 				udpConn, err := net.ListenUDP("udp", localAddr)
 				if err != nil {
-					return nil, err
-				}
-				// Protect socket from VPN routing
-				if err := protectUDPConn(udpConn, protector); err != nil {
-					udpConn.Close()
 					return nil, err
 				}
 				if cfg == nil {
@@ -441,7 +423,7 @@ func padQuery(query []byte) []byte {
 	// Append EDNS0 padding option: code=12, length=padLen, data=zeros
 	opt := make([]byte, 4+padLen)
 	binary.BigEndian.PutUint16(opt[0:2], 12)             // option code: padding
-	binary.BigEndian.PutUint16(opt[2:4], uint16(padLen))  // option length
+	binary.BigEndian.PutUint16(opt[2:4], uint16(padLen)) // option length
 	// opt[4:] is already zeroed
 
 	// Append padding to the OPT record and update its RDLENGTH
@@ -682,12 +664,12 @@ type dnsInterceptor struct {
 
 // newDnsInterceptor creates a dnsInterceptor that resolves all DNS via DoH.
 // Returns nil if no DoH URL is configured.
-func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProtector) *dnsInterceptor {
+func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig) *dnsInterceptor {
 	if cfg.DoHURL == "" {
 		return nil
 	}
 
-	doh := newDohProxy(cfg.DoHURL, protector)
+	doh := newDohProxy(cfg.DoHURL)
 	doh.warmConnection()
 
 	d := &dnsInterceptor{
@@ -703,17 +685,15 @@ func newDnsInterceptor(ctx context.Context, cfg *tunnelConfig, protector VpnProt
 	return d
 }
 
-// systemDnsResolver forwards DNS queries via protected UDP sockets to system DNS servers.
+// systemDnsResolver forwards DNS queries via UDP sockets to system DNS servers.
 type systemDnsResolver struct {
 	cachedResolver
-	servers   []string
-	protector VpnProtector
+	servers []string
 }
 
-func newSystemDnsResolver(servers []string, protector VpnProtector) *systemDnsResolver {
+func newSystemDnsResolver(servers []string) *systemDnsResolver {
 	s := &systemDnsResolver{
-		servers:   servers,
-		protector: protector,
+		servers: servers,
 	}
 	s.cachedResolver = *newCachedResolver(1024, s.queryServers)
 	return s
@@ -733,7 +713,7 @@ func (s *systemDnsResolver) queryServers(query []byte) ([]byte, error) {
 	return nil, fmt.Errorf("all system DNS servers failed: %v", lastErr)
 }
 
-// queryServer sends a DNS query to a single server via a protected UDP socket.
+// queryServer sends a DNS query to a single server via a UDP socket.
 func (s *systemDnsResolver) queryServer(server string, query []byte) ([]byte, error) {
 	addr, err := net.ResolveUDPAddr("udp", net.JoinHostPort(server, "53"))
 	if err != nil {
@@ -751,11 +731,6 @@ func (s *systemDnsResolver) queryServer(server string, query []byte) ([]byte, er
 		return nil, fmt.Errorf("listen: %w", err)
 	}
 	defer conn.Close()
-
-	// Protect socket from VPN routing
-	if err := protectUDPConn(conn, s.protector); err != nil {
-		return nil, err
-	}
 
 	conn.SetDeadline(time.Now().Add(2 * time.Second))
 
@@ -780,13 +755,13 @@ func (s *systemDnsResolver) queryServer(server string, query []byte) ([]byte, er
 }
 
 // newSystemDnsInterceptor creates a dnsInterceptor that forwards DNS queries
-// to system DNS servers via protected UDP sockets (bypassing the VPN).
-func newSystemDnsInterceptor(ctx context.Context, servers []string, protector VpnProtector) *dnsInterceptor {
+// to system DNS servers via UDP sockets (bypassing the VPN).
+func newSystemDnsInterceptor(ctx context.Context, servers []string) *dnsInterceptor {
 	if len(servers) == 0 {
 		return nil
 	}
 
-	resolver := newSystemDnsResolver(servers, protector)
+	resolver := newSystemDnsResolver(servers)
 
 	d := &dnsInterceptor{
 		resolver: resolver.resolve,
@@ -1208,4 +1183,3 @@ func (c *tunnelDnsCache) cacheResponse(pkt []byte) {
 		expiry:   time.Now().Add(extractMinTTL(payload)),
 	})
 }
-

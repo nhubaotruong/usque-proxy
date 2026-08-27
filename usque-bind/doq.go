@@ -26,7 +26,7 @@ type doqProxy struct {
 	makeConn func() (*quic.Conn, *net.UDPConn, error)
 }
 
-func newDoqProxy(addr string, protector VpnProtector) *doqProxy {
+func newDoqProxy(addr string) *doqProxy {
 	// Default port 853 per RFC 9250
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
@@ -53,12 +53,6 @@ func newDoqProxy(addr string, protector VpnProtector) *doqProxy {
 		udpConn, err := net.ListenUDP("udp", localAddr)
 		if err != nil {
 			return nil, nil, fmt.Errorf("DoQ UDP socket: %w", err)
-		}
-
-		// Protect socket from VPN routing
-		if err := protectUDPConn(udpConn, protector); err != nil {
-			udpConn.Close()
-			return nil, nil, err
 		}
 
 		tlsCfg := &tls.Config{
@@ -209,12 +203,12 @@ func isDoqRetryable(err error) bool {
 }
 
 // newDoqDnsInterceptor creates a dnsInterceptor that resolves all DNS via DoQ.
-func newDoqDnsInterceptor(ctx context.Context, doqAddr string, protector VpnProtector) *dnsInterceptor {
+func newDoqDnsInterceptor(ctx context.Context, doqAddr string) *dnsInterceptor {
 	if doqAddr == "" {
 		return nil
 	}
 
-	doq := newDoqProxy(doqAddr, protector)
+	doq := newDoqProxy(doqAddr)
 	doq.warmConnection()
 
 	d := &dnsInterceptor{

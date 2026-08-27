@@ -8,9 +8,10 @@
 // arrive on the TUN. This file implements the exclusion in userspace: TCP
 // and UDP packets whose destination matches an excluded prefix are handed to
 // a gVisor netstack instance which terminates the connections locally, and
-// the data is relayed through sockets protected from the VPN
-// (VpnService.protect), i.e. out the real underlying network — the same
-// pattern the system-DNS interceptor already uses for port 53.
+// the data is relayed through plain sockets. Since the app self-excludes its
+// own package from the VPN (addDisallowedApplication), these sockets bypass
+// the TUN automatically — the same pattern the system-DNS interceptor uses
+// for port 53.
 package usquebind
 
 import (
@@ -22,7 +23,6 @@ import (
 	"net"
 	"strconv"
 	"sync"
-	"syscall"
 
 	"gvisor.dev/gvisor/pkg/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -43,25 +43,25 @@ const (
 	tcpMaxInFlight = 1024
 )
 
-// directForwarder relays TCP/UDP traffic to excluded prefixes through
-// protected sockets. It is nil when no prefixes are configured (API 33+ uses
-// kernel excludeRoute instead, so no packets reach the TUN for them).
+// directForwarder relays TCP/UDP traffic to excluded prefixes over plain
+// sockets that bypass the TUN (the app self-excludes from the VPN). It is nil
+// when no prefixes are configured (API 33+ uses kernel excludeRoute instead,
+// so no packets reach the TUN for them).
 type directForwarder struct {
-	ctx       context.Context
-	cancel    context.CancelFunc
-	stack     *stack.Stack
-	nicID     tcpip.NICID
-	endpoint  *channel.Endpoint
-	prefixes  []*net.IPNet
-	protector VpnProtector
-	writePkt  func([]byte) error
-	connsMu   sync.Mutex
-	conns     map[net.Conn]struct{}
+	ctx      context.Context
+	cancel   context.CancelFunc
+	stack    *stack.Stack
+	nicID    tcpip.NICID
+	endpoint *channel.Endpoint
+	prefixes []*net.IPNet
+	writePkt func([]byte) error
+	connsMu  sync.Mutex
+	conns    map[net.Conn]struct{}
 }
 
 // newDirectForwarder builds the forwarder for the given CIDR prefixes.
 // Returns nil if prefixes is empty.
-func newDirectForwarder(prefixes []string, mtu uint32, protector VpnProtector, writePkt func([]byte) error) (*directForwarder, error) {
+func newDirectForwarder(prefixes []string, mtu uint32, writePkt func([]byte) error) (*directForwarder, error) {
 	nets := make([]*net.IPNet, 0, len(prefixes))
 	for _, cidr := range prefixes {
 		ipnet, err := parsePrefix(cidr)
@@ -101,15 +101,14 @@ func newDirectForwarder(prefixes []string, mtu uint32, protector VpnProtector, w
 
 	ctx, cancel := context.WithCancel(context.Background())
 	df := &directForwarder{
-		ctx:       ctx,
-		cancel:    cancel,
-		stack:     stk,
-		nicID:     nicID,
-		endpoint:  ep,
-		prefixes:  nets,
-		protector: protector,
-		writePkt:  writePkt,
-		conns:     make(map[net.Conn]struct{}),
+		ctx:      ctx,
+		cancel:   cancel,
+		stack:    stk,
+		nicID:    nicID,
+		endpoint: ep,
+		prefixes: nets,
+		writePkt: writePkt,
+		conns:    make(map[net.Conn]struct{}),
 	}
 
 	tcpFwd := tcp.NewForwarder(stk, tcpRecvWindow, tcpMaxInFlight, df.handleTCP)
@@ -237,13 +236,13 @@ func (df *directForwarder) wait(wq *waiter.Queue, mask waiter.EventMask) error {
 }
 
 // handleTCP is invoked by the stack for each new inbound TCP connection to an
-// excluded prefix. It dials the real destination through a protected socket
-// and relays bytes in both directions.
+// excluded prefix. It dials the real destination and relays bytes in both
+// directions.
 func (df *directForwarder) handleTCP(r *tcp.ForwarderRequest) {
 	go func() {
 		id := r.ID()
 		dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
-		conn, err := dialProtected(df.ctx, "tcp", dst, df.protector)
+		conn, err := (&net.Dialer{}).DialContext(df.ctx, "tcp", dst)
 		if err != nil {
 			log.Printf("direct dial failed: %v", err)
 			r.Complete(true) // reset the connection
@@ -269,7 +268,7 @@ func (df *directForwarder) handleUDP(r *udp.ForwarderRequest) bool {
 	go func() {
 		id := r.ID()
 		dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
-		conn, err := dialProtected(df.ctx, "udp", dst, df.protector)
+		conn, err := (&net.Dialer{}).DialContext(df.ctx, "udp", dst)
 		if err != nil {
 			return
 		}
@@ -371,24 +370,4 @@ func (df *directForwarder) stackToConn(ep tcpip.Endpoint, wq *waiter.Queue, conn
 			return
 		}
 	}
-}
-
-// dialProtected dials a real destination through a socket excluded from the
-// VPN, so the relayed traffic goes out the underlying network.
-func dialProtected(ctx context.Context, network, addr string, protector VpnProtector) (net.Conn, error) {
-	d := net.Dialer{
-		Control: func(_, _ string, rc syscall.RawConn) error {
-			var protectErr error
-			err := rc.Control(func(fd uintptr) {
-				if !protector.ProtectFd(int(fd)) {
-					protectErr = errors.New("VPN protect() failed on direct socket")
-				}
-			})
-			if err != nil {
-				return err
-			}
-			return protectErr
-		},
-	}
-	return d.DialContext(ctx, network, addr)
 }

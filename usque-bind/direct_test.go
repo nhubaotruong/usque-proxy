@@ -14,10 +14,6 @@ import (
 	"time"
 )
 
-type fakeProtector struct{}
-
-func (f fakeProtector) ProtectFd(fd int) bool { return true }
-
 // TestDirectInject proves the gVisor demux + TCP forwarder + protected dial
 // chain: a crafted SYN to an excluded prefix must reach handleTCP and relay
 // to the real destination (host flask listener on :8000). Uses the host's
@@ -27,7 +23,6 @@ func TestDirectInject(t *testing.T) {
 	df, err := newDirectForwarder(
 		[]string{hostIP + "/32"},
 		1280,
-		fakeProtector{},
 		func(pkt []byte) error { return nil }, // outbound pump sink
 	)
 	if err != nil {
