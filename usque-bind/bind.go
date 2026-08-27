@@ -179,6 +179,11 @@ func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
 		mu.Unlock()
 		return fmt.Errorf("no endpoint v4 in config")
 	}
+	ep := endpointFromConfig(&tcfg)
+	if ep == nil {
+		mu.Unlock()
+		return fmt.Errorf("invalid endpoint: %s", tcfg.EndpointV4)
+	}
 
 	ctx, c := context.WithCancel(context.Background())
 	cancel = c
@@ -303,7 +308,7 @@ func StartTunnel(configJSON string, tunFd int, listener TunnelListener) error {
 		TLSConfig:         tlsCfg,
 		KeepalivePeriod:   30 * time.Second,
 		InitialPacketSize: 1242,
-		Endpoint:          endpointFromConfig(&tcfg),
+		Endpoint:          ep,
 		Device:            device,
 		MTU:               1280,
 		ReconnectDelay:    1 * time.Second,
