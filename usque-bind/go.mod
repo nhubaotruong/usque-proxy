@@ -5,7 +5,7 @@ go 1.26.3
 require (
 	github.com/Diniboy1123/connect-ip-go v0.0.0-20260613064811-66cba32d7d33
 	github.com/Diniboy1123/usque v1.5.1-0.20260720063354-6aa03fc97d12
-	github.com/quic-go/quic-go v0.60.0
+	github.com/quic-go/quic-go v0.62.0
 	github.com/yosida95/uritemplate/v3 v3.0.2
 	golang.org/x/mobile v0.0.0-20260821190718-4776eadac327
 	golang.org/x/net v0.58.0
