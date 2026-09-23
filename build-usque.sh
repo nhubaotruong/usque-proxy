@@ -4,14 +4,14 @@ set -euo pipefail
 cd "$(dirname "$0")/usque-bind"
 
 echo "Building usque AAR via gomobile..."
-# Force Go 1.26.3 toolchain to match go.mod and avoid gvisor build tag conflicts
-export GOTOOLCHAIN=go1.26.3
+# Force Go 1.27.0 toolchain to match go.mod and avoid gvisor build tag conflicts
+export GOTOOLCHAIN=go1.27.0
 # Ensure GOPATH/bin is in PATH for gomobile/gobind
 export PATH="$(go env GOPATH)/bin:$PATH"
 # Use Go module proxy to avoid fetching from deleted repos (e.g. mitchellh/osext)
 export GOPROXY=https://proxy.golang.org,direct
 # -ldflags="-s -w" strips debug info for smaller binary
-# CGO flags tuned for Android 15+ (API 35) 16KB page size:
+# CGO flags: 16KB page alignment (Android 15+ devices use 16KB pages; larger alignment is compatible with 4KB-page devices):
 #   -z,max-page-size / common-page-size = 16KB page alignment for PT_LOAD segments
 #   --gc-sections removes unreferenced code/data (paired with -ffunction/data-sections)
 #   -O1 enables linker optimization pass; --as-needed skips unused shared libs
@@ -23,7 +23,8 @@ if [ -f default.pgo ]; then
   PGO_FLAG="-pgo=default.pgo"
 fi
 
-gomobile bind -v -target=android/arm64,android/amd64 -androidapi 35 \
+# -androidapi 30 = AAR minSdk (Android 11+); matches app/build.gradle.kts minSdk
+gomobile bind -v -target=android/arm64,android/amd64 -androidapi 30 \
   -trimpath \
   -ldflags="-s -w" \
   ${PGO_FLAG:+"$PGO_FLAG"} \

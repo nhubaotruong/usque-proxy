@@ -13,9 +13,14 @@ func TestGetStatsShape(t *testing.T) {
 	if err := json.Unmarshal([]byte(s), &m); err != nil {
 		t.Fatalf("stats not valid JSON: %v", err)
 	}
-	for _, k := range []string{"running", "connected", "tx_bytes", "rx_bytes", "uptime_sec", "has_network", "connect_count"} {
+	for _, k := range []string{"running", "connected", "tx_bytes", "rx_bytes", "uptime_sec"} {
 		if _, ok := m[k]; !ok {
 			t.Errorf("stats missing key %q", k)
+		}
+	}
+	for _, k := range []string{"has_network", "connect_count", "last_error"} {
+		if _, ok := m[k]; ok {
+			t.Errorf("stats must not contain key %q", k)
 		}
 	}
 	if _, ok := m["running"].(bool); !ok {
@@ -28,7 +33,7 @@ func TestGetStatsShape(t *testing.T) {
 
 // TestStartTunnelInvalidConfig verifies config validation happens before any network I/O.
 func TestStartTunnelInvalidConfig(t *testing.T) {
-	err := StartTunnel("{not json", 0, nil, nil)
+	err := StartTunnel("{not json", 0, nil)
 	if err == nil || !strings.Contains(err.Error(), "invalid config JSON") {
 		t.Fatalf("expected invalid config JSON error, got %v", err)
 	}
