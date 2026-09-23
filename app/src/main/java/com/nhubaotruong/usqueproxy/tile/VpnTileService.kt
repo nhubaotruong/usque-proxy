@@ -1,10 +1,12 @@
 package com.nhubaotruong.usqueproxy.tile
 
 import android.app.PendingIntent
+import android.annotation.SuppressLint
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.VpnService
+import android.os.Build
 import android.service.quicksettings.Tile
 import android.service.quicksettings.TileService
 import androidx.core.content.ContextCompat
@@ -59,16 +61,23 @@ class VpnTileService : TileService() {
         tile.updateTile()
     }
 
+    // The Intent overload only throws on API 34+ devices (guarded above); safe to call below.
+    @SuppressLint("StartActivityAndCollapseDeprecated")
     private fun openApp(action: String? = null) {
         val intent = Intent(this, MainActivity::class.java).apply {
             addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             if (action != null) this.action = action
         }
-        startActivityAndCollapse(
-            PendingIntent.getActivity(
-                this, 0, intent,
-                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-            ),
-        )
+        // startActivityAndCollapse(PendingIntent) is API 34+; the Intent overload is API 24+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            startActivityAndCollapse(
+                PendingIntent.getActivity(
+                    this, 0, intent,
+                    PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+                ),
+            )
+        } else {
+            startActivityAndCollapse(intent)
+        }
     }
 }
